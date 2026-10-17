@@ -1,0 +1,19 @@
+{
+  "title": "Auto Scaling Web Application on AWS",
+  "tech_stack": [
+    "AWS",
+    "EC2",
+    "ALB",
+    "VPC",
+    "Auto Scaling",
+    "CloudWatch",
+    "IAM",
+    "Python",
+    "Flask",
+    "gunicorn",
+    "Linux"
+  ],
+  "description": "Designed and deployed a production-grade auto-scaling architecture on AWS: custom VPC with public/private subnets across 2 Availability Zones, ALB, Auto Scaling Group (min 2 / max 6 EC2 instances), and CloudWatch-driven scaling policies. Built a Golden AMI strategy to eliminate the NAT Gateway, saving ~-35/month with zero internet dependency at boot. Flask v3 dashboard with live instance metadata and /load simulation.",
+  "github_url": "https://github.com/Punit-154/AWS_Cloud_Auto_Scale",
+  "live_demo_url": null
+}

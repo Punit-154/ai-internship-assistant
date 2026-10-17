@@ -1,0 +1,16 @@
+{
+  "title": "RAG Q&A -- Document Chat with Retrieval-Augmented Generation",
+  "tech_stack": [
+    "FastAPI",
+    "Streamlit",
+    "ChromaDB",
+    "HuggingFace",
+    "Groq/Llama 3.1",
+    "Python",
+    "RAG",
+    "Vector Databases"
+  ],
+  "description": "Built a full-stack RAG application using Llama 3.1, implementing PDF chunking, local embeddings, ChromaDB vector retrieval, and FastAPI endpoints for grounded document Q&A, with query rewriting and LLM-as-a-judge faithfulness evaluation.",
+  "github_url": "https://github.com/Punit-154/RAG_Q-A",
+  "live_demo_url": null
+}

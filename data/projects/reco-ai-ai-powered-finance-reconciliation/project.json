@@ -1,0 +1,16 @@
+{
+  "title": "Reco.ai -- AI-Powered Finance Reconciliation",
+  "tech_stack": [
+    "Next.js",
+    "FastAPI",
+    "PostgreSQL",
+    "Groq/Llama 3.3-70B",
+    "Razorpay API",
+    "Python",
+    "Pydantic",
+    "pytest"
+  ],
+  "description": "Built a three-layer reconciliation engine (deterministic rules -> LLM classification -> human approval) that auto-matched 50% of a 100-case batch instantly, with the AI layer classifying the remaining 50% into actionable exception categories backed by Pydantic-validated evidence and an append-only human-review audit trail. Measured five evaluation metrics against isolated ground truth with 98 CI-safe unit tests.",
+  "github_url": "https://github.com/Punit-154/Reco.ai",
+  "live_demo_url": null
+}

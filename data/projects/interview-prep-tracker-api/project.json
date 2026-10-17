@@ -1,0 +1,22 @@
+{
+  "title": "Interview Prep Tracker API",
+  "tech_stack": [
+    "Python",
+    "Django",
+    "Django REST Framework",
+    "djangorestframework-simplejwt",
+    "django-filter",
+    "PostgreSQL",
+    "SQLite",
+    "WhiteNoise",
+    "Gunicorn",
+    "OpenAPI",
+    "Swagger UI",
+    "ReDoc",
+    "pytest",
+    "Render"
+  ],
+  "description": "A RESTful backend service built with Django and Django REST Framework to monitor coding interview preparation and metrics using stateless JWT authentication. The system enforces data integrity and tenant isolation through database-level unique constraints, custom object permissions, and strictly scoped user querysets. It features dynamic filtering, pagination, and real-time ORM aggregations to compute practice analytics, backed by OpenAPI 3.0 documentation and an automated test suite.",
+  "github_url": "https://github.com/Punit-154/interview-prep-tracker-api",
+  "live_demo_url": null
+}

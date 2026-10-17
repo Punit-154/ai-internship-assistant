@@ -1,0 +1,16 @@
+{
+  "title": "SpecVault -- Full-Stack Product Specifications Platform",
+  "tech_stack": [
+    "Next.js",
+    "FastAPI",
+    "Supabase",
+    "JWT",
+    "JWKS",
+    "Python",
+    "PostgreSQL",
+    "REST APIs"
+  ],
+  "description": "Architected a defense-in-depth security model combining JWT authentication with JWKS verification at the API layer and Supabase Row-Level Security at the database layer. Built full-stack CRUD with paginated listing (1-100 items/page).",
+  "github_url": "https://github.com/Punit-154/SpecVault",
+  "live_demo_url": null
+}

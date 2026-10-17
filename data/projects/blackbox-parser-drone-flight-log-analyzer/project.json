@@ -1,0 +1,16 @@
+{
+  "title": "BlackBox-Parser -- Drone Flight Log Analyzer",
+  "tech_stack": [
+    "Python",
+    "pymavlink",
+    "Matplotlib",
+    "Folium",
+    "fpdf2",
+    "pytest",
+    "MAVLink",
+    "ArduPilot"
+  ],
+  "description": "Developed a modular CLI tool to parse MAVLink (.tlog) and ArduPilot DataFlash (.bin) logs; implemented Haversine distance computation, LiPo battery estimation, anomaly detection, and PDF/HTML report generation with interactive flight-track maps.",
+  "github_url": "https://github.com/Punit-154/BlackBox-Parser",
+  "live_demo_url": null
+}
