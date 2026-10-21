@@ -106,6 +106,7 @@ def ingest_github_project(
     client: Optional[genai.Client] = None,
     raw_readme_override: Optional[str] = None,
     projects_dir: Optional[Path] = None,
+    profile_path: Optional[Path] = None,
 ) -> Tuple[ProjectItem, List[str], Path]:
     """Ingest a project from GitHub URL, extract deep tech details, and sync to profile.
     
@@ -151,7 +152,7 @@ def ingest_github_project(
     saved_folder = save_project_to_knowledge_base(project, readme_content, projects_dir)
 
     # 4. Sync into candidate profile and add new verified skills
-    _, new_skills = add_project_to_profile(project)
+    _, new_skills = add_project_to_profile(project, file_path=profile_path)
 
     return project, new_skills, saved_folder
 

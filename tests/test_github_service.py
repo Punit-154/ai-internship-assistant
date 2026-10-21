@@ -73,11 +73,13 @@ def test_ingest_github_project_mocked(tmp_path: Path):
         text=mock_item.model_dump_json()
     )
 
+    test_prof_file = tmp_path / "test_candidate_profile.json"
     project, new_skills, folder = ingest_github_project(
         url_or_text="https://github.com/punit/log-processor",
         client=mock_client,
         raw_readme_override="# Log Processor\nBuilt with Go and Kafka.",
         projects_dir=tmp_path,
+        profile_path=test_prof_file,
     )
 
     assert project.title == "Distributed Log Processor"

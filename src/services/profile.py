@@ -15,6 +15,7 @@ from google.genai import types
 from src.config import settings
 from src.models.candidate import CandidateProfile, ProjectItem
 from src.models.job import EligibilityStatus
+from src.services.skills import find_matching_skill
 
 logger = logging.getLogger(__name__)
 
@@ -225,14 +226,13 @@ def evaluate_job_match(
     else:
         location_fit = "Location not listed"
 
-    # 4. Skill Overlap Analysis
-    verified_skills_lower = {s.lower() for s in p.verified_skills}
+    # 4. Skill Overlap Analysis (alias-aware; see src/services/skills.py)
     matching_skills = []
     missing_skills = []
 
     for req in required_skills:
         req_clean = req.strip()
-        if any(req_clean.lower() in s or s in req_clean.lower() for s in verified_skills_lower):
+        if req_clean and find_matching_skill(req_clean, p.verified_skills):
             matching_skills.append(req_clean)
         else:
             missing_skills.append(req_clean)

@@ -25,6 +25,7 @@ from src.models.job import JobPosting
 from src.services.extractor import generate_content_with_fallback, get_genai_client
 from src.services.github_service import get_all_stored_projects
 from src.services.pdf_generator import generate_resume_pdf
+from src.services.skills import find_matching_skill, match_skill
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +82,18 @@ class TailoredResumeResult:
 
 
 def extract_ats_keywords_from_job(job: JobPosting) -> List[str]:
-    """Extract discrete technical keywords and competencies from the job description."""
-    keywords = set()
+    """Extract discrete technical keywords and competencies from the job description.
+
+    Alias-equivalent keywords are deduplicated (e.g., "DRF" folded into
+    "Django REST Framework" keeps only whichever appears first).
+    """
+    keywords: List[str] = []
     for s in (job.required_skills + job.preferred_skills):
         clean = s.strip()
-        if clean and len(clean) > 1:
-            keywords.add(clean)
+        if not clean or len(clean) < 2:
+            continue
+        if find_matching_skill(clean, keywords) is None:
+            keywords.append(clean)
 
     text_corpus = f"{job.role_title} {job.notes or ''}".lower()
     common_terms = [
@@ -98,10 +105,13 @@ def extract_ats_keywords_from_job(job: JobPosting) -> List[str]:
         "algorithms", "object-oriented programming", "system design", "linux"
     ]
     for term in common_terms:
-        if term in text_corpus:
-            keywords.add(term.title() if term not in ("sql", "aws", "gcp", "ci/cd") else term.upper())
+        if term not in text_corpus:
+            continue
+        display = term.title() if term not in ("sql", "aws", "gcp", "ci/cd") else term.upper()
+        if find_matching_skill(display, keywords) is None:
+            keywords.append(display)
 
-    return sorted(list(keywords))
+    return keywords
 
 
 def audit_ats_keywords(
@@ -109,24 +119,28 @@ def audit_ats_keywords(
     profile: CandidateProfile,
     stored_projects: Optional[List[Dict]] = None,
 ) -> ATSAuditReport:
-    """Cross-reference job ATS keywords against candidate verified skills and project READMEs."""
-    verified_lower = {s.lower() for s in profile.verified_skills}
+    """Cross-reference job ATS keywords against candidate verified skills and project READMEs.
 
-    for proj in profile.verified_projects:
-        for t in proj.tech_stack:
-            verified_lower.add(t.lower())
-
+    Uses alias-aware matching (src/services/skills.py) so acronym forms
+    such as "DRF" resolve against "Django REST Framework".
+    """
+    verified_pool: List[str] = list(profile.verified_skills)
+    verified_pool.extend(
+        t for proj in profile.verified_projects for t in proj.tech_stack
+    )
     if stored_projects:
-        for p in stored_projects:
-            for t in p.get("meta", {}).get("tech_stack", []):
-                verified_lower.add(t.lower())
+        verified_pool.extend(
+            t
+            for p in stored_projects
+            for t in p.get("meta", {}).get("tech_stack", [])
+        )
+    verified_pool = list(dict.fromkeys(v.strip() for v in verified_pool if v.strip()))
 
     matched = []
     missing = []
 
     for kw in target_keywords:
-        kw_clean = kw.strip().lower()
-        if any(kw_clean in v or v in kw_clean for v in verified_lower):
+        if find_matching_skill(kw, verified_pool):
             matched.append(kw)
         else:
             missing.append(kw)
