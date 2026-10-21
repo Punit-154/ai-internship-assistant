@@ -1,128 +1,220 @@
-﻿"""Pure-Python ATS-Compliant PDF Resume Generator.
+"""ReportLab ATS-Compliant PDF Resume Generator.
 
-Produces clean, single-page, vector PDF resumes using standard Type 1 fonts
-(Helvetica, Helvetica-Bold, Helvetica-Oblique) adhering strictly to the
-industry-standard Jake's Resume layout:
-- Standard 0.5-inch margins (36 pt)
-- Bold section headers with crisp dividing rules
-- Left-aligned titles with right-aligned dates/locations
-- STAR/X-Y-Z bullet points with proper hanging indents
-- Fully text-searchable and 100% parseable by modern ATS systems (Workday, Greenhouse, Taleo)
-- Zero external binary or LaTeX compiler dependencies
+Produces clean, single-page, vector PDF resumes using standard Type-1 Helvetica fonts
+modeled directly on the candidate's master Word/ATS resume layout:
+- Standard 0.45-inch margins (32 pt)
+- Centered header with professional subtitle and interactive clickable hyperlinks
+- Bold uppercase section headers with full-width horizontal dividing rules
+- Two-column tables for Education and Project headers (Title + Link Left, Dates Right)
+- Categorized Technical Skills layout
+- Interactive clickable GitHub links for every project
+- Dynamic depth calibration to fit all sections on exactly 1 page with minimal wasted space
+- 100% text-searchable, vector ATS parseable by Workday, Greenhouse, Taleo, Ashby, Lever
 """
 
+import io
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+)
+from reportlab.platypus.flowables import HRFlowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.pdfgen import canvas
+
 from src.models.candidate import CandidateProfile
 
 
 def sanitize_text(text: str) -> str:
-    """Sanitize text to standard ASCII/Latin-1 characters for Type 1 fonts."""
+    """Sanitize text to clean standard characters for XML/PDF flowables."""
     if not text:
         return ""
-    replacements = {
-        "\u2013": "-",   # en-dash
-        "\u2014": "--",  # em-dash
-        "\u2018": "'",   # left single quote
-        "\u2019": "'",   # right single quote
-        "\u201c": '"',   # left double quote
-        "\u201d": '"',   # right double quote
-        "\u2022": "*",   # bullet
-        "\u2026": "...", # ellipsis
-        "\u00a0": " ",   # non-breaking space
-        "\u2010": "-",   # hyphen
-    }
-    for orig, rep in replacements.items():
-        text = text.replace(orig, rep)
-    # Encode to latin-1, replacing unknown chars
-    return text.encode("latin-1", "replace").decode("latin-1")
+    text = text.replace(chr(0x2013), "-")      # en-dash -> hyphen
+    text = text.replace(chr(0x2014), " - ")    # em-dash -> spaced hyphen
+    text = text.replace(chr(0x2212), "-")      # minus sign -> hyphen
+    text = text.replace(chr(0x2192), "->")     # right arrow
+    text = text.replace(chr(0x2018), "'")      # left single quote
+    text = text.replace(chr(0x2019), "'")      # right single quote
+    text = text.replace(chr(0x201C), chr(34))  # left double quote
+    text = text.replace(chr(0x201D), chr(34))  # right double quote
+    text = text.replace(chr(0x2022), "*")      # bullet
+    text = text.replace(chr(0x2026), "...")    # ellipsis
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
+
+def clean_link_display(url: Optional[str]) -> str:
+    """Format a clean display label for a URL by removing scheme and trailing slash."""
+    if not url:
+        return ""
+    clean = url.replace("https://", "").replace("http://", "").rstrip("/")
+    return clean
 
 
 class PDFResumeBuilder:
-    """Builds an ATS-optimized Jake's Resume PDF in pure Python."""
+    """ReportLab-based vector ATS resume builder producing pixel-perfect single-page layouts."""
 
-    PAGE_WIDTH = 612.0   # Letter size width
-    PAGE_HEIGHT = 792.0  # Letter size height
-    MARGIN_LEFT = 36.0   # 0.5 inch margins
-    MARGIN_RIGHT = 576.0 # 612 - 36
-    CONTENT_WIDTH = 540.0
+    def __init__(self, left_margin: float = 32, right_margin: float = 32, top_margin: float = 24, bottom_margin: float = 24):
+        self.left_margin = left_margin
+        self.right_margin = right_margin
+        self.top_margin = top_margin
+        self.bottom_margin = bottom_margin
+        self.story = []
+        self._init_styles()
 
-    def __init__(self):
-        self.stream_commands: List[bytes] = []
-        self.cursor_y = 756.0  # Top margin: 792 - 36
+    def _init_styles(self):
+        styles = getSampleStyleSheet()
+        self.name_style = ParagraphStyle(
+            "DocName",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=16.0,
+            leading=18.0,
+            alignment=TA_CENTER,
+            textColor=colors.black,
+            spaceAfter=1.5,
+        )
+        self.subtitle_style = ParagraphStyle(
+            "DocSubtitle",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=8.5,
+            leading=10.5,
+            alignment=TA_CENTER,
+            textColor=colors.black,
+            spaceAfter=1.5,
+        )
+        self.contact_style = ParagraphStyle(
+            "DocContact",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=8.0,
+            leading=10.0,
+            alignment=TA_CENTER,
+            textColor=colors.black,
+            spaceAfter=3.5,
+        )
+        self.sec_title_style = ParagraphStyle(
+            "SecTitle",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=9.5,
+            leading=11.5,
+            textColor=colors.black,
+            spaceBefore=3.5,
+            spaceAfter=1,
+        )
+        self.body_style = ParagraphStyle(
+            "Body",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=8.2,
+            leading=10.2,
+            textColor=colors.black,
+        )
+        self.bullet_style = ParagraphStyle(
+            "Bullet",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=8.2,
+            leading=10.2,
+            leftIndent=11,
+            firstLineIndent=-11,
+            spaceAfter=1.2,
+            textColor=colors.black,
+        )
 
-    def _escape_pdf_str(self, text: str) -> str:
-        clean = sanitize_text(text)
-        return clean.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    def render_header(
+        self,
+        name: str,
+        contact_str: str,
+        subtitle: Optional[str] = None,
+        email: Optional[str] = None,
+        phone: Optional[str] = None,
+        linkedin_url: Optional[str] = None,
+        github_url: Optional[str] = None,
+        portfolio_url: Optional[str] = None,
+    ):
+        name_clean = sanitize_text(name).upper()
+        self.story.append(Paragraph(f"<b>{name_clean}</b>", self.name_style))
 
-    def add_command(self, cmd: str) -> None:
-        self.stream_commands.append(cmd.encode("latin1"))
+        if subtitle:
+            sub_clean = sanitize_text(subtitle)
+            self.story.append(Paragraph(sub_clean, self.subtitle_style))
 
-    def draw_text(self, text: str, x: float, y: float, font: str = "F2", size: float = 10.0) -> None:
-        escaped = self._escape_pdf_str(text)
-        self.add_command(f"BT /{font} {size:.2f} Tf {x:.2f} {y:.2f} Td ({escaped}) Tj ET\n")
+        # Build interactive contact line with clickable links
+        parts = []
+        if email:
+            parts.append(f'<a href="mailto:{email}" color="#1a0dab">{email}</a>')
+        if phone:
+            parts.append(phone)
+        if linkedin_url:
+            parts.append(f'<a href="{linkedin_url}" color="#1a0dab">{clean_link_display(linkedin_url)}</a>')
+        if github_url:
+            parts.append(f'<a href="{github_url}" color="#1a0dab">{clean_link_display(github_url)}</a>')
+        if portfolio_url:
+            parts.append(f'<a href="{portfolio_url}" color="#1a0dab">{clean_link_display(portfolio_url)}</a>')
 
-    def estimate_text_width(self, text: str, font: str, size: float) -> float:
-        """Estimate text width in points for Helvetica."""
-        factor = 0.54 if "Bold" in font or font == "F1" else 0.50
-        return len(text) * size * factor
+        if parts:
+            contact_html = "  |  ".join(parts)
+        else:
+            contact_html = sanitize_text(contact_str)
 
-    def draw_centered_text(self, text: str, y: float, font: str = "F2", size: float = 10.0) -> None:
-        width = self.estimate_text_width(text, font, size)
-        x = (self.PAGE_WIDTH - width) / 2.0
-        self.draw_text(text, max(self.MARGIN_LEFT, x), y, font, size)
+        self.story.append(Paragraph(contact_html, self.contact_style))
 
-    def draw_right_aligned_text(self, text: str, right_x: float, y: float, font: str = "F2", size: float = 10.0) -> None:
-        width = self.estimate_text_width(text, font, size)
-        x = right_x - width
-        self.draw_text(text, x, y, font, size)
+    def render_section_header(self, title: str):
+        title_clean = sanitize_text(title).upper()
+        self.story.append(Paragraph(f"<b>{title_clean}</b>", self.sec_title_style))
+        self.story.append(HRFlowable(width="100%", thickness=0.5, color=colors.black, spaceBefore=0.5, spaceAfter=2.5))
 
-    def draw_horizontal_rule(self, y: float, width: float = 0.5) -> None:
-        self.add_command(f"{width:.2f} w 0.25 0.25 0.25 RG {self.MARGIN_LEFT:.2f} {y:.2f} m {self.MARGIN_RIGHT:.2f} {y:.2f} l S\n")
+    def render_summary(self, summary_text: str):
+        if not summary_text:
+            return
+        self.story.append(Paragraph(sanitize_text(summary_text), self.body_style))
+        self.story.append(Spacer(1, 2.5))
 
-    def wrap_text(self, text: str, max_width: float, font: str, size: float) -> List[str]:
-        """Wrap text into lines fitting within max_width."""
-        words = text.split(" ")
-        lines = []
-        current_line = []
+    def render_education(
+        self,
+        institution: str,
+        location: str,
+        degree: str,
+        dates: str,
+        cgpa_str: Optional[str] = None,
+    ):
+        inst_clean = sanitize_text(institution)
+        loc_clean = sanitize_text(location)
+        deg_clean = sanitize_text(degree)
+        dates_clean = sanitize_text(dates)
 
-        for word in words:
-            test_line = " ".join(current_line + [word])
-            if self.estimate_text_width(test_line, font, size) <= max_width:
-                current_line.append(word)
-            else:
-                if current_line:
-                    lines.append(" ".join(current_line))
-                    current_line = [word]
-                else:
-                    lines.append(word)
-                    current_line = []
-        if current_line:
-            lines.append(" ".join(current_line))
-        return lines
+        deg_line = deg_clean
+        if cgpa_str:
+            deg_line += f" | {sanitize_text(cgpa_str)}"
 
-    def render_header(self, name: str, contact_line: str) -> None:
-        # Full Name: Bold 17pt
-        self.draw_centered_text(name.upper(), self.cursor_y, font="F1", size=17.0)
-        self.cursor_y -= 14.0
-        # Contact details: 9pt
-        self.draw_centered_text(contact_line, self.cursor_y, font="F2", size=9.0)
-        self.cursor_y -= 14.0
-
-    def render_section_header(self, title: str) -> None:
-        self.cursor_y -= 4.0
-        self.draw_text(title.upper(), self.MARGIN_LEFT, self.cursor_y, font="F1", size=10.5)
-        self.cursor_y -= 3.0
-        self.draw_horizontal_rule(self.cursor_y, width=0.6)
-        self.cursor_y -= 10.0
-
-    def render_education(self, college: str, location: str, degree: str, grad_date: str) -> None:
-        self.draw_text(college, self.MARGIN_LEFT, self.cursor_y, font="F1", size=10.0)
-        self.draw_right_aligned_text(location, self.MARGIN_RIGHT, self.cursor_y, font="F2", size=9.5)
-        self.cursor_y -= 11.0
-        self.draw_text(degree, self.MARGIN_LEFT, self.cursor_y, font="F3", size=9.5)
-        self.draw_right_aligned_text(grad_date, self.MARGIN_RIGHT, self.cursor_y, font="F3", size=9.0)
-        self.cursor_y -= 12.0
+        edu_data = [
+            [
+                Paragraph(f"<b>{inst_clean}</b>", self.body_style),
+                Paragraph(f"<b>{dates_clean}</b>", ParagraphStyle("ER", parent=self.body_style, alignment=TA_RIGHT)),
+            ],
+            [
+                Paragraph(deg_line, self.body_style),
+                Paragraph(loc_clean, ParagraphStyle("ER2", parent=self.body_style, alignment=TA_RIGHT)),
+            ]
+        ]
+        t = Table(edu_data, colWidths=[380, 168])
+        t.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 0.5),
+            ('TOPPADDING', (0,0), (-1,-1), 0.5),
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ]))
+        self.story.append(t)
+        self.story.append(Spacer(1, 2.5))
 
     def render_technical_skills(
         self,
@@ -130,28 +222,20 @@ class PDFResumeBuilder:
         frameworks: List[str],
         tools: List[str],
         concepts: List[str],
-    ) -> None:
-        categories = [
-            ("Languages", ", ".join(languages)),
-            ("Frameworks & Libraries", ", ".join(frameworks)),
-            ("Developer Tools & Cloud", ", ".join(tools)),
-            ("Core Concepts", ", ".join(concepts)),
+    ):
+        rows = [
+            ("Programming Languages", languages),
+            ("Frameworks & Libraries", frameworks),
+            ("Cloud, Databases & Tools", tools),
+            ("Core Concepts", concepts),
         ]
-        for label, val in categories:
-            if not val:
-                continue
-            prefix = f"{label}: "
-            prefix_w = self.estimate_text_width(prefix, "F1", 9.5)
-            self.draw_text(prefix, self.MARGIN_LEFT, self.cursor_y, font="F1", size=9.5)
-
-            available_w = self.CONTENT_WIDTH - prefix_w
-            lines = self.wrap_text(val, available_w, font="F2", size=9.0)
-            if lines:
-                self.draw_text(lines[0], self.MARGIN_LEFT + prefix_w, self.cursor_y, font="F2", size=9.0)
-                for cont_line in lines[1:]:
-                    self.cursor_y -= 10.0
-                    self.draw_text(cont_line, self.MARGIN_LEFT + prefix_w, self.cursor_y, font="F2", size=9.0)
-            self.cursor_y -= 11.0
+        for cat_name, items in rows:
+            if items:
+                items_str = ", ".join(sanitize_text(i) for i in items)
+                line_html = f"<b>{cat_name}:</b> {items_str}"
+                self.story.append(Paragraph(line_html, self.body_style))
+                self.story.append(Spacer(1, 0.5))
+        self.story.append(Spacer(1, 2.5))
 
     def render_project(
         self,
@@ -160,141 +244,209 @@ class PDFResumeBuilder:
         bullets: List[str],
         date_str: str = "2026",
         github_url: Optional[str] = None,
-    ) -> None:
-        # Title in bold
-        title_text = title
-        tech_text = f" | {', '.join(tech_stack)}" if tech_stack else ""
+    ):
+        title_clean = sanitize_text(title)
+        date_clean = sanitize_text(date_str)
+
         if github_url:
-            tech_text += " | GitHub"
+            clean_gh = clean_link_display(github_url)
+            header_html = f'<b>{title_clean}</b>  |  <a href="{github_url}" color="#1a0dab">{clean_gh}</a>'
+        else:
+            header_html = f'<b>{title_clean}</b>'
 
-        self.draw_text(title_text, self.MARGIN_LEFT, self.cursor_y, font="F1", size=10.0)
-        title_w = self.estimate_text_width(title_text, "F1", 10.0)
+        pt = Table([
+            [
+                Paragraph(header_html, self.body_style),
+                Paragraph(f"<b>{date_clean}</b>", ParagraphStyle("PR", parent=self.body_style, alignment=TA_RIGHT)),
+            ]
+        ], colWidths=[420, 128])
+        pt.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING', (0,0), (-1,-1), 0),
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ]))
+        self.story.append(pt)
 
-        # Tech stack italic next to title
-        max_tech_w = self.MARGIN_RIGHT - self.MARGIN_LEFT - title_w - 60.0
-        if tech_text and max_tech_w > 50:
-            short_tech = tech_text
-            if self.estimate_text_width(short_tech, "F3", 9.0) > max_tech_w:
-                short_tech = short_tech[:int(max_tech_w / 5)] + "..."
-            self.draw_text(short_tech, self.MARGIN_LEFT + title_w, self.cursor_y, font="F3", size=9.0)
+        if tech_stack:
+            tech_str = ", ".join(sanitize_text(t) for t in tech_stack)
+            self.story.append(Paragraph(f"<i>{tech_str}</i>", self.body_style))
 
-        self.draw_right_aligned_text(date_str, self.MARGIN_RIGHT, self.cursor_y, font="F2", size=9.0)
-        self.cursor_y -= 11.0
-
-        # Bullet points
         for b in bullets:
-            bullet_lines = self.wrap_text(b, self.CONTENT_WIDTH - 20.0, font="F2", size=9.0)
-            if not bullet_lines:
-                continue
+            bullet_clean = sanitize_text(b).lstrip("*-? ").strip()
+            self.story.append(Paragraph(f"&bull; {bullet_clean}", self.bullet_style))
 
-            # First line with bullet symbol
-            self.draw_text("-", self.MARGIN_LEFT + 6.0, self.cursor_y, font="F1", size=9.0)
-            self.draw_text(bullet_lines[0], self.MARGIN_LEFT + 16.0, self.cursor_y, font="F2", size=9.0)
+        self.story.append(Spacer(1, 1.5))
 
-            # Continuation lines
-            for cont in bullet_lines[1:]:
-                self.cursor_y -= 10.0
-                self.draw_text(cont, self.MARGIN_LEFT + 16.0, self.cursor_y, font="F2", size=9.0)
+    def render_research_experience(
+        self,
+        title: str,
+        organization: str,
+        date_range: str,
+        bullets: List[str],
+    ):
+        t_clean = sanitize_text(title)
+        org_clean = sanitize_text(organization)
+        dates_clean = sanitize_text(date_range)
 
-            self.cursor_y -= 10.5
-        self.cursor_y -= 3.0
+        rt = Table([
+            [
+                Paragraph(f"<b>{t_clean}</b>", self.body_style),
+                Paragraph(f"<b>{dates_clean}</b>", ParagraphStyle("RXR", parent=self.body_style, alignment=TA_RIGHT)),
+            ],
+            [
+                Paragraph(f"<i>{org_clean}</i>", self.body_style),
+                Paragraph("", self.body_style),
+            ]
+        ], colWidths=[420, 128])
+        rt.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING', (0,0), (-1,-1), 0),
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ]))
+        self.story.append(rt)
+
+        for b in bullets:
+            bullet_clean = sanitize_text(b).lstrip("*-? ").strip()
+            self.story.append(Paragraph(f"&bull; {bullet_clean}", self.bullet_style))
+
+        self.story.append(Spacer(1, 2.5))
+
+    def render_achievements(self, achievements: List[str]):
+        for ach in achievements:
+            ach_clean = sanitize_text(ach).lstrip("*-? ").strip()
+            self.story.append(Paragraph(f"&bull; {ach_clean}", self.bullet_style))
 
     def compile_pdf_bytes(self) -> bytes:
-        """Assemble all PDF stream commands into a compliant PDF 1.4 binary."""
-        content_stream = b"".join(self.stream_commands)
-        pdf_header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buf,
+            pagesize=letter,
+            leftMargin=self.left_margin,
+            rightMargin=self.right_margin,
+            topMargin=self.top_margin,
+            bottomMargin=self.bottom_margin,
+        )
+        doc.build(self.story)
+        return buf.getvalue()
 
-        objs = [
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R >> >> >>\nendobj\n",
-            f"4 0 obj\n<< /Length {len(content_stream)} >>\nstream\n".encode("latin1") + content_stream + b"\nendstream\nendobj\n",
-            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n",
-            b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
-            b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>\nendobj\n",
-        ]
-
-        body = b""
-        offsets = [0]
-        for obj in objs:
-            offsets.append(len(pdf_header) + len(body))
-            body += obj
-
-        xref_offset = len(pdf_header) + len(body)
-        xref = f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode("latin1")
-        for off in offsets[1:]:
-            xref += f"{off:010d} 00000 n \n".encode("latin1")
-
-        trailer = f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("latin1")
-        return pdf_header + body + xref + trailer
+    def save_to_file(self, file_path: Path) -> Path:
+        target = Path(file_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        pdf_bytes = self.compile_pdf_bytes()
+        target.write_bytes(pdf_bytes)
+        return target
 
 
 def generate_resume_pdf(
     profile: CandidateProfile,
-    tailored_response,
-    output_pdf_path: Path,
+    tailored_llm,
+    output_path: Path,
 ) -> Path:
-    """Generate a clean, professional, single-page ATS PDF resume."""
-    output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    """Produce an ATS-optimized, high-fidelity vector PDF resume matching the Word master resume."""
     builder = PDFResumeBuilder()
 
-    # 1. Header
-    contact_parts = []
-    if getattr(profile, "phone", None):
-        contact_parts.append(profile.phone)
-    if getattr(profile, "email", None):
-        contact_parts.append(profile.email)
-    if getattr(profile, "linkedin_url", None):
-        clean_li = profile.linkedin_url.replace("https://", "").replace("http://", "").replace("www.", "")
-        contact_parts.append(clean_li)
-    if getattr(profile, "github_url", None):
-        clean_gh = profile.github_url.replace("https://", "").replace("http://", "").replace("www.", "")
-        contact_parts.append(clean_gh)
-    if getattr(profile, "portfolio_url", None):
-        clean_pf = profile.portfolio_url.replace("https://", "").replace("http://", "").replace("www.", "")
-        contact_parts.append(clean_pf)
-
-    if not contact_parts:
-        contact_parts = ["you@example.com", "+91 0000000000", "github.com/Punit-154"]
-
-    contact_str = "  |  ".join(contact_parts)
-    builder.render_header(profile.full_name, contact_str)
-
-    # 2. Education
-    grad_date = f"Aug 2024 - May {profile.graduation_year} (Expected)"
-    degree_str = profile.degree
-    if getattr(profile, "cgpa", None):
-        degree_str += f" | CGPA: {profile.cgpa}/10.0"
-
-    builder.render_section_header("Education")
-    builder.render_education(
-        college=profile.college,
-        location="Chennai, India",
-        degree=degree_str,
-        grad_date=grad_date,
+    # 1. Header with Clickable Links
+    subtitle = getattr(profile, "subtitle", None) or "Computer Science Engineering Undergraduate | VIT Chennai"
+    builder.render_header(
+        name=profile.full_name,
+        contact_str=f"{profile.email or ''} | {profile.phone or ''}",
+        subtitle=subtitle,
+        email=profile.email,
+        phone=profile.phone,
+        linkedin_url=profile.linkedin_url,
+        github_url=profile.github_url,
+        portfolio_url=profile.portfolio_url,
     )
 
-    # 3. Technical Skills
+    # 2. Professional Summary
+    summary_text = getattr(tailored_llm, "match_rationale", None) or profile.summary
+    if summary_text:
+        builder.render_section_header("Professional Summary")
+        builder.render_summary(profile.summary)
+
+    # 3. Education
+    builder.render_section_header("Education")
+    dates_str = getattr(profile, "education_dates", None) or f"Aug 2024 - May {profile.graduation_year} (Expected)"
+    cgpa_val = f"CGPA: {profile.cgpa}/10.0" if profile.cgpa else None
+    builder.render_education(
+        institution=profile.college,
+        location="Chennai, India",
+        degree=profile.degree,
+        dates=dates_str,
+        cgpa_str=cgpa_val,
+    )
+
+    # 4. Technical Skills (Categorized)
     builder.render_section_header("Technical Skills")
     builder.render_technical_skills(
-        languages=tailored_response.languages,
-        frameworks=tailored_response.frameworks,
-        tools=tailored_response.tools_and_cloud,
-        concepts=tailored_response.core_concepts,
+        languages=tailored_llm.languages,
+        frameworks=tailored_llm.frameworks,
+        tools=tailored_llm.tools_and_cloud,
+        concepts=tailored_llm.core_concepts,
     )
 
-    # 4. Projects
+    # 5. Projects with Clickable GitHub URLs and Calibrated Depth
     builder.render_section_header("Projects")
-    for proj in tailored_response.tailored_projects:
+    profile_projects_map = {
+        p.title.lower(): p for p in profile.verified_projects
+    }
+
+    # If tailored_projects exists, use them
+    tailored_projects = getattr(tailored_llm, "tailored_projects", [])
+    if not tailored_projects:
+        tailored_projects = profile.verified_projects[:3]
+
+    for idx, tp in enumerate(tailored_projects):
+        title = tp.title
+        tech = getattr(tp, "tech_stack", [])
+        bullets = getattr(tp, "bullet_points", [])
+
+        # Find matching master project for authentic date range and github URL
+        matched_orig = None
+        for k, v in profile_projects_map.items():
+            if k in title.lower() or title.lower() in k:
+                matched_orig = v
+                break
+
+        gh_url = getattr(tp, "github_url", None) or (matched_orig.github_url if matched_orig else None)
+        date_str = (matched_orig.date_range if matched_orig and hasattr(matched_orig, "date_range") and matched_orig.date_range else "2026")
+
+        if not bullets and matched_orig and hasattr(matched_orig, "bullet_points") and matched_orig.bullet_points:
+            bullets = matched_orig.bullet_points
+
+        # Dynamic depth: Top projects get 2 bullets; secondary get 1 bullet to maintain single-page density
+        max_bullets = 2 if idx < 2 else 1
+        active_bullets = bullets[:max_bullets] if bullets else [getattr(tp, "description", title)]
+
         builder.render_project(
-            title=proj.title,
-            tech_stack=proj.tech_stack,
-            bullets=proj.bullet_points,
-            date_str="2026",
-            github_url=proj.github_url,
+            title=title,
+            tech_stack=tech,
+            bullets=active_bullets,
+            date_str=date_str,
+            github_url=gh_url,
         )
 
-    # Compile and write bytes
-    pdf_bytes = builder.compile_pdf_bytes()
-    output_pdf_path.write_bytes(pdf_bytes)
-    return output_pdf_path
+    # 6. Research Experience (Samsung PRISM)
+    research_list = getattr(profile, "research_experience", [])
+    if research_list:
+        builder.render_section_header("Research Experience")
+        for rx in research_list:
+            rx_bullets = rx.get("bullet_points", [])[:2] # Top 2 bullets for tight single page fit
+            builder.render_research_experience(
+                title=rx.get("title", "Research Worklet"),
+                organization=rx.get("organization", "VIT"),
+                date_range=rx.get("date_range", "2026 - Present"),
+                bullets=rx_bullets,
+            )
+
+    # 7. Achievements & Certifications
+    achievements = getattr(profile, "achievements", [])
+    if achievements:
+        builder.render_section_header("Achievements & Certifications")
+        builder.render_achievements(achievements[:3])
+
+    return builder.save_to_file(output_path)

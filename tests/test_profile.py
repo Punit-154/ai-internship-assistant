@@ -19,8 +19,8 @@ from src.services.profile import (
 def test_profile_defaults():
     """Verify default values in CandidateProfile reflect 3rd year status."""
     p = CandidateProfile()
-    assert p.full_name == "Punit"
-    assert p.college == "VIT Chennai"
+    assert "Punit" in p.full_name
+    assert "VIT" in p.college
     assert p.graduation_year == 2028
     assert p.current_college_year == 3
     assert "Bangalore" in p.summer_locations

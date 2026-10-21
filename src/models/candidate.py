@@ -1,4 +1,4 @@
-﻿"""Candidate Profile Model and Preferences Schema.
+"""Candidate Profile Model and Preferences Schema.
 
 Represents your student background, graduation timeline, domain targets,
 and location/availability preferences.
@@ -15,17 +15,21 @@ class ProjectItem(BaseModel):
     description: str = Field(description="Concise, impact-oriented summary of what the project does")
     github_url: Optional[str] = Field(default=None, description="GitHub repository URL if available")
     live_demo_url: Optional[str] = Field(default=None, description="Live deployed URL or demo link if available")
+    date_range: Optional[str] = Field(default=None, description="Project REDACTED date range (e.g., 'Aug 2026 - Sep 2026')")
+    bullet_points: List[str] = Field(default_factory=list, description="Detailed verified bullet points describing accomplishments")
 
 
 class CandidateProfile(BaseModel):
     """Personal candidate profile and internship constraints."""
 
     # Personal & Academic Background
-    full_name: str = Field(default="Punit", description="Candidate full name")
-    college: str = Field(default="VIT Chennai", description="University name")
-    degree: str = Field(default="B.Tech Computer Science and Engineering", description="Degree program")
+    full_name: str = Field(default="Your Full Name", description="Candidate full name")
+    subtitle: str = Field(default="Computer Science Engineering Undergraduate | VIT Chennai", description="Professional subtitle")
+    college: str = Field(default="Vellore Institute of Technology (VIT), Chennai", description="University name")
+    degree: str = Field(default="B.Tech in Computer Science Engineering", description="Degree program")
     current_college_year: int = Field(default=3, description="Current year of study (3rd Year / Pre-final)")
     graduation_year: int = Field(default=2028, description="Target graduation year")
+    education_dates: str = Field(default="Aug 2024 - Aug 2028 (Expected)", description="Duration of academic program")
     cgpa: Optional[float] = Field(default=9.22, description="Academic CGPA")
     email: Optional[str] = Field(default="you@example.com", description="Candidate contact email")
     phone: Optional[str] = Field(default="+91 0000000000", description="Candidate contact phone number")
@@ -67,14 +71,20 @@ class CandidateProfile(BaseModel):
     verified_skills: List[str] = Field(
         default=[
             "Python",
+            "Java",
+            "C",
             "FastAPI",
-            "SQL",
+            "Flask",
+            "Next.js",
+            "Django",
+            "Django REST Framework",
             "PostgreSQL",
             "AWS",
             "Git",
             "Data Structures",
             "Algorithms",
-            "REST APIs",
+            "RESTful APIs",
+            "pytest",
         ],
         description="Skills you have actively used and can defend in interviews",
     )
@@ -83,6 +93,18 @@ class CandidateProfile(BaseModel):
     verified_projects: List[ProjectItem] = Field(
         default_factory=list,
         description="List of verified personal projects and achievements",
+    )
+
+    # Research & Industry Experience
+    research_experience: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Verified research worklets or industry lab experience",
+    )
+
+    # Achievements & Certifications
+    achievements: List[str] = Field(
+        default_factory=list,
+        description="Verified hackathon awards, honors, and industrial certifications",
     )
 
     notes: Optional[str] = Field(
