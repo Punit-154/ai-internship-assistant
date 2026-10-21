@@ -40,13 +40,15 @@ def test_scrape_url_success():
 
 
 def test_scrape_url_http_404_error():
-    """Test handling of 404 Not Found error."""
+    """Test handling of 404 Not Found error (search fallback stubbed to stay offline)."""
     mock_response = MagicMock()
     mock_response.status_code = 404
     mock_response.text = "Page Not Found"
     mock_response.url = "https://careers.acme.com/jobs/404"
 
-    with patch("httpx.Client.get", return_value=mock_response):
+    with patch("httpx.Client.get", return_value=mock_response), patch(
+        "src.services.scraper._search_grounding_fallback", return_value=None
+    ):
         result = scrape_url("https://careers.acme.com/jobs/404")
 
         assert result.success is False
@@ -55,8 +57,10 @@ def test_scrape_url_http_404_error():
 
 
 def test_scrape_url_timeout():
-    """Test handling of network timeouts."""
-    with patch("httpx.Client.get", side_effect=httpx.TimeoutException("Connection timed out")):
+    """Test handling of network timeouts (search fallback stubbed to stay offline)."""
+    with patch("httpx.Client.get", side_effect=httpx.TimeoutException("Connection timed out")), patch(
+        "src.services.scraper._search_grounding_fallback", return_value=None
+    ):
         result = scrape_url("https://slow-site.com/jobs")
 
         assert result.success is False
