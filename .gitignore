@@ -1,0 +1,32 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment secrets
+.env
+*.env.local
+
+# Database & local data
+*.db
+*.sqlite3
+data/uploads/*
+!data/uploads/.gitkeep
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
