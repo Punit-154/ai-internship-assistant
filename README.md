@@ -73,9 +73,15 @@ data/candidate_profile.json")]
 - **Interactive Telegram UI**: Quick-action inline keyboard buttons to update status, tailor resumes, or view application portals in one tap.
 - **Deadline Monitoring**: View closing opportunities (`/deadlines`) with urgency badges (`?? CLOSING TODAY`, `?? 2d left`).
 
-### 5. Automated Daily Intelligence Briefing
-- **Scheduled Digest**: Delivers an 8:00 AM morning executive summary directly to your private Telegram chat.
+### 5. Automated Background Intelligence (Real Scheduler)
+- **Scheduled 8:00 AM Digest**: Delivers a morning executive summary directly to your private Telegram chat via the PTB JobQueue — idempotent, so restarts never double-send (`scheduler_log` ledger).
+- **Deadline Reminders**: A background sweep every 4 hours pushes urgency-grouped reminders for deadlines within 2 days.
 - **Curated Insights**: Highlights top-matching new opportunities, active interview pipelines, and urgent deadlines.
+
+### 6. Proactive Internship Discovery (`/watch` + `/discover`)
+- **ATS Board Watchlist**: Register public Ashby, Greenhouse and Lever boards (or any careers URL) with `/watch add lever spotify` — the board is probed live before saving.
+- **Automatic Sweeps**: A background job re-checks every watched board every 2 hours; new intern/trainee postings are ingested, verified against scams, scored against your profile, and pushed to Telegram only if alert-worthy (score >= 0.65). Everything else is saved silently for `/list`.
+- **Skill Alias Matching**: "DRF" matches "Django REST Framework", "K8s" matches Kubernetes, "Go" matches "Golang" — matching uses an alias resolver rather than dumb substrings.
 
 ---
 
@@ -105,6 +111,8 @@ ai-internship-assistant/
 ?   ?   ??? job.py                 # Job posting & audit models
 ?   ??? services/
 ?       ??? digest.py              # Morning intelligence digest generator
+?       ??? discovery.py           # Proactive ATS board sweeper (/watch watchlist)
+?       ??? skills.py              # Skill alias/acronym resolver
 ?       ??? extractor.py           # Gemini 3.8 Flash structured extractor
 ?       ??? github_service.py      # GitHub README fetcher & KB persistence
 ?       ??? pdf_generator.py       # Pure-vector Type-1 ATS PDF generator
@@ -113,7 +121,7 @@ ai-internship-assistant/
 ?       ??? resume.py              # ATS keyword audit & resume tailorer
 ?       ??? scraper.py             # HTTPX scraper & ATS resolver
 ?       ??? verifier.py            # Anti-scam heuristics & search grounding
-??? tests/                         # Comprehensive pytest test suite (68 tests)
+??? tests/                         # Comprehensive pytest test suite (99 tests)
 ??? .env                           # Local environment credentials (ignored by git)
 ??? .env.example                   # Environment configuration template
 ??? internships.db                 # SQLite database storage
@@ -190,7 +198,11 @@ The assistant includes a full-featured CLI for terminal workflows:
 | `deadlines` | Lists upcoming deadlines within N days | `python -m src.interfaces.cli deadlines --days 7` |
 | `digest` | Generates the daily intelligence briefing | `python -m src.interfaces.cli digest` |
 | `tailor` | Generates ATS vector PDF resume and pitch for a job | `python -m src.interfaces.cli tailor 8` |
-| `run-bot` | Starts the Telegram Bot long-polling daemon | `python -m src.interfaces.cli run-bot` |
+| `run-bot` | Starts the Telegram Bot long-polling daemon (background scheduler included) | `python -m src.interfaces.cli run-bot` |
+| `watch add` | Register an ATS board / careers URL for proactive discovery | `python -m src.interfaces.cli watch add lever spotify` |
+| `watch list` | Lists watched boards with last-checked status and errors | `python -m src.interfaces.cli watch list` |
+| `watch remove` | Stops watching a board (by ID from `watch list`) | `python -m src.interfaces.cli watch remove 2` |
+| `discover` | Runs one discovery sweep across all watched boards now | `python -m src.interfaces.cli discover` |
 
 ---
 
@@ -207,6 +219,8 @@ The assistant includes a full-featured CLI for terminal workflows:
 | `/deadlines` | `/deadlines [days]` | Alerts on deadlines approaching in the next 7?14 days |
 | `/digest` | `/digest` | Generates and sends today's intelligence summary on demand |
 | `/tailor` | `/tailor <id>` | Tailors an ATS vector PDF resume and delivers it to your chat |
+| `/watch` | `/watch add lever spotify` / `/watch list` / `/watch remove 2` | Manages the ATS discovery watchlist (boards are probed before saving) |
+| `/discover` | `/discover` | Runs a discovery sweep now; alert-worthy new postings arrive as cards |
 
 ### Direct Mobile Ingestion
 - **Send any URL**: Simply paste a job link into Telegram. The bot resolves the ATS, extracts requirements, checks eligibility, and replies with an interactive card.
@@ -271,25 +285,27 @@ pytest -v
 **Results:**
 ```
 ============================= test session starts =============================
-collected 68 items
+collected 99 items
 
-tests/test_bot.py .......                                                [ 10%]
-tests/test_config.py ..                                                  [ 13%]
-tests/test_database.py ......                                            [ 22%]
-tests/test_digest.py ..                                                  [ 25%]
-tests/test_extractor.py ...                                              [ 29%]
-tests/test_github_service.py ....                                        [ 35%]
-tests/test_models.py ..                                                  [ 38%]
-tests/test_multimodal.py ......                                          [ 47%]
-tests/test_pdf_generator.py ...                                          [ 51%]
-tests/test_pipeline.py ......                                            [ 60%]
-tests/test_profile.py .........                                          [ 73%]
-tests/test_resume.py ...                                                 [ 77%]
-tests/test_scraper.py ....                                               [ 83%]
-tests/test_status_tracking.py .....                                      [ 91%]
+tests/test_bot.py .........                                              [  9%]
+tests/test_config.py ..                                                  [ 11%]
+tests/test_database.py ..........                                        [ 21%]
+tests/test_digest.py ..                                                  [ 23%]
+tests/test_discovery.py ...........                                      [ 34%]
+tests/test_extractor.py ........                                         [ 42%]
+tests/test_github_service.py ....                                        [ 46%]
+tests/test_models.py ..                                                  [ 48%]
+tests/test_multimodal.py ......                                          [ 54%]
+tests/test_pdf_generator.py ...                                          [ 57%]
+tests/test_pipeline.py ......                                            [ 63%]
+tests/test_profile.py .........                                          [ 72%]
+tests/test_resume.py ...                                                 [ 75%]
+tests/test_scraper.py ....                                               [ 79%]
+tests/test_skills.py .........                                           [ 88%]
+tests/test_status_tracking.py .....                                      [ 93%]
 tests/test_verifier.py ......                                            [100%]
 
-============================== 68 passed in 3.8s ==============================
+============================== 99 passed ==============================
 ```
 
 ---
