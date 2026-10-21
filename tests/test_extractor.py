@@ -3,7 +3,12 @@
 import json
 from unittest.mock import MagicMock
 import pytest
-from src.services.extractor import ExtractedJobData, extract_job_from_text
+from src.services.extractor import (
+    ExtractedJobData,
+    extract_job_from_text,
+    extract_jobs_list_from_text,
+    extract_multiple_jobs_from_text,
+)
 
 
 def test_extracted_job_data_model():
@@ -65,3 +70,80 @@ def test_extract_job_short_text_error():
     """Verify ValueError is raised when input text is too short."""
     with pytest.raises(ValueError, match="Input text is too short"):
         extract_job_from_text("Too short")
+
+
+# ==============================================================================
+# Batch & List Extractors (used by the discovery engine)
+# ==============================================================================
+
+def test_extract_multiple_jobs_from_text_mocked():
+    """Verify blocks -> bundle alignment, with a missing slot mapped to None."""
+    bundle_payload = {
+        "jobs": [
+            {"index": 1, "data": {
+                "company_name": "Lever Co", "role_title": "Backend Intern",
+                "locations": ["Remote"], "allowed_grad_years": [2028],
+                "required_skills": ["Python", "SQL"], "preferred_skills": [],
+                "eligibility_notes": "", "confidence_score": 0.9,
+            }},
+            {"index": 3, "data": {
+                "company_name": "Lever Co", "role_title": "QA Intern",
+                "locations": ["Boston"], "allowed_grad_years": [],
+                "required_skills": ["Java"], "preferred_skills": [],
+                "eligibility_notes": "", "confidence_score": 0.8,
+            }},
+        ]
+    }
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value.text = json.dumps(bundle_payload)
+
+    results = extract_multiple_jobs_from_text(["block one", "unparseable", "block three"], client=mock_client)
+
+    assert results[0] is not None
+    assert results[0].role_title == "Backend Intern"
+    assert results[1] is None
+    assert results[2] is not None
+    assert results[2].role_title == "QA Intern"
+
+
+def test_extract_multiple_jobs_empty_input():
+    assert extract_multiple_jobs_from_text([]) == []
+
+
+def test_extract_multiple_jobs_never_raises(monkeypatch):
+    """LLM outage must degrade to None slots, not crash the discovery run."""
+    from src.services import extractor as extractor_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("gemini down")
+    monkeypatch.setattr(extractor_module, "generate_content_with_fallback", boom)
+
+    results = extract_multiple_jobs_from_text(["some block"], client=MagicMock())
+    assert results == [None]
+
+
+def test_extract_jobs_list_from_text_mocked():
+    """Careers-page listing extraction returns multiple distinct postings."""
+    list_payload = {
+        "jobs": [
+            {"company_name": "CustomCorp", "role_title": "SWE Intern",
+             "locations": ["Remote"], "required_skills": ["Python"],
+             "eligibility_notes": "", "confidence_score": 0.9},
+            {"company_name": "CustomCorp", "role_title": "Senior Engineer",
+             "locations": ["NYC"], "required_skills": ["Go"],
+             "eligibility_notes": "", "confidence_score": 0.9},
+        ]
+    }
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value.text = json.dumps(list_payload)
+
+    jobs = extract_jobs_list_from_text(
+        "CustomCorp careers page listing multiple open engineering positions and postings across teams.",
+        client=mock_client,
+    )
+    assert len(jobs) == 2
+    assert jobs[0].role_title == "SWE Intern"
+
+
+def test_extract_jobs_list_empty_or_failed():
+    assert extract_jobs_list_from_text("") == []

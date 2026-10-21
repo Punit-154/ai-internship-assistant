@@ -182,6 +182,34 @@ def format_digest_html(report: DigestReport) -> str:
     return "\n".join(lines)
 
 
+def format_deadline_reminder_html(jobs_days: List[Tuple[JobPosting, int]]) -> str:
+    """Format urgent unapplied deadlines into a compact Telegram HTML push.
+
+    Called by the scheduled deadline sweep (not the manual /digest command).
+    """
+    lines = [
+        "⏰ <b>DEADLINE ALERT</b> — unapplied opportunities closing soon:",
+        "",
+    ]
+    for job, days_left in jobs_days:
+        comp = html.escape(job.company_name)
+        role = html.escape(job.role_title)
+        d_str = job.application_deadline.strftime("%b %d") if job.application_deadline else "Soon"
+        if days_left == 0:
+            urgency = "🚨 <b>CLOSING TODAY</b>"
+        elif days_left == 1:
+            urgency = "⚠️ <b>CLOSES TOMORROW</b>"
+        else:
+            urgency = f"⏳ <b>{days_left} days left</b> ({d_str})"
+        lines.append(
+            f"• <b>#{job.id} {comp}</b> — {role}\n"
+            f"  {urgency} | Status: <code>{job.application_status.value.upper()}</code> | <code>/tailor {job.id}</code>"
+        )
+    lines.append("")
+    lines.append("<i>Applied already?</i> <code>/status &lt;id&gt; applied</code> <i>to stop reminders.</i>")
+    return "\n".join(lines)
+
+
 def format_digest_text(report: DigestReport) -> str:
     """Format the digest into plain text for CLI terminal display."""
     formatted_date = report.report_date.strftime("%A, %b %d, %Y")

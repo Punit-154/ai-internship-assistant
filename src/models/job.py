@@ -22,6 +22,7 @@ class IngestionSource(str, Enum):
     TELEGRAM_TEXT = "telegram_text"
     CLI_INPUT = "cli_input"
     MANUAL_ENTRY = "manual_entry"
+    DISCOVERY = "discovery"
 
 
 class EligibilityStatus(str, Enum):

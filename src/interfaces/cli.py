@@ -394,6 +394,92 @@ def cmd_run_bot(args):
     run_telegram_bot()
 
 
+def cmd_watch(args):
+    """Manage the ATS board watchlist for proactive discovery."""
+    from src.config import settings
+    from src.database import (
+        add_watch_target,
+        deactivate_watch_target,
+        list_watch_targets,
+        touch_watch_target,
+    )
+    from src.services.discovery import fetch_target_listings, is_internship_title
+
+    action = args.action
+
+    if action == "list":
+        with get_session() as session:
+            targets = list_watch_targets(session, active_only=False)
+            if not targets:
+                print("[-] Watchlist empty. Add one: python -m src.interfaces.cli watch add lever spotify")
+                return
+            print(f"\n{'ID':<4} | {'Company':<22} | {'Type':<11} | {'Key':<26} | {'On':<4} | {'Checked':<16}")
+            print("-" * 100)
+            for t in targets:
+                checked = t.last_checked_at.strftime("%Y-%m-%d %H:%M") if t.last_checked_at else "never"
+                err = f" [error: {t.last_error[:40]}]" if t.last_error else ""
+                print(f"{t.id:<4} | {t.company_name[:22]:<22} | {t.target_type.value.split('_')[0]:<11} | {t.target_key[:26]:<26} | {'yes' if t.active else 'no':<4} | {checked}{err}")
+            print("-" * 100)
+            print(f"Total: {len(targets)} target(s) | Telegram: /watch list | Manual sweep: /discover\n")
+        return
+
+    if action == "add":
+        company_label = (args.company or args.key.replace("-", " ")).title().strip()
+        if args.type in {"url", "custom"} and not str(args.key).startswith(("http://", "https://")):
+            key = "https://" + str(args.key).lstrip("/")
+        else:
+            key = args.key
+        with get_session() as session:
+            try:
+                target = add_watch_target(session, company_label, args.type, key)
+            except ValueError as exc:
+                print(f"[!] {exc}")
+                print(f"    Allowed types: ashby, greenhouse, lever, url")
+                sys.exit(1)
+            print(f"[+] Watch target #{target.id} registered: {target.company_name} ({target.target_type.value})")
+            print(f"    Poll interval: every {settings.DISCOVERY_CHECK_INTERVAL_HOURS}h | Max ingested/run: {settings.DISCOVERY_MAX_PER_RUN}")
+
+            print("[*] Verifying board is reachable...")
+            try:
+                listings = fetch_target_listings(target)
+                intern_count = sum(1 for l in listings if is_internship_title(l.title))
+                print(f"[+] Board reachable. Live postings: {len(listings)} (approx {intern_count} intern/trainee roles)")
+            except Exception as exc:
+                touch_watch_target(session, target.id, error=str(exc)[:400])
+                print(f"[!] Board check FAILED: {exc}")
+                print("    Double-check the slug/token in a browser; discovery will keep retrying.")
+        return
+
+    if action == "remove":
+        with get_session() as session:
+            target = deactivate_watch_target(session, args.target_id)
+            if target:
+                print(f"[+] Stopped watching '{target.company_name}' (#{target.id}).")
+            else:
+                print(f"[!] Watch target #{args.target_id} not found.")
+                sys.exit(1)
+
+
+def cmd_discover(args):
+    """Run one discovery sweep across all active watch targets."""
+    from src.services.discovery import is_alertable, run_discovery
+
+    with get_session() as session:
+        outcomes = run_discovery(session)
+
+    if not outcomes:
+        print("[-] No new postings discovered across your watchlist.")
+        return
+
+    for outcome in outcomes:
+        tag = "[ALERT]" if is_alertable(outcome) else "[quiet]"
+        print(f"{tag} #{outcome.job.id} {outcome.job.company_name} - {outcome.job.role_title} "
+              f"(score {int(outcome.match_score * 100)}%, {outcome.job.verification_status.value})")
+        print_job_card(outcome.job)
+
+    print(f"[+] Ingested {len(outcomes)} new posting(s). Telegram pushes will match the [ALERT] filter.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="AI Internship Intelligence CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -440,6 +526,20 @@ def main():
     # run-bot
     subparsers.add_parser("run-bot", help="Start the Telegram Bot long-polling daemon")
 
+    # watch (discovery watchlist management)
+    watch_parser = subparsers.add_parser("watch", help="Manage ATS board watchlist for proactive discovery")
+    watch_sub = watch_parser.add_subparsers(dest="action", required=True)
+    watch_add = watch_sub.add_parser("add", help="Watch an ATS board or careers URL")
+    watch_add.add_argument("type", type=str, help="Board type: ashby | greenhouse | lever | url")
+    watch_add.add_argument("key", type=str, help="Board slug/token, or careers page URL for 'url' type")
+    watch_add.add_argument("--company", type=str, default=None, help="Company label (default: prettified key)")
+    watch_sub.add_parser("list", help="List watch targets and their status")
+    watch_remove = watch_sub.add_parser("remove", help="Stop watching a target")
+    watch_remove.add_argument("target_id", type=int, help="Watch target ID from 'watch list'")
+
+    # discover (manual discovery sweep)
+    subparsers.add_parser("discover", help="Run one discovery sweep across active watch targets")
+
     # digest
     subparsers.add_parser("digest", help="Display daily internship intelligence briefing")
 
@@ -474,6 +574,10 @@ def main():
         cmd_tailor_resume(args)
     elif args.command == "run-bot":
         cmd_run_bot(args)
+    elif args.command == "watch":
+        cmd_watch(args)
+    elif args.command == "discover":
+        cmd_discover(args)
     elif args.command == "digest":
         cmd_digest(args)
     elif args.command == "deadlines":

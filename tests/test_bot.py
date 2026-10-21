@@ -70,6 +70,7 @@ def test_url_regex_matcher():
 
 def test_build_telegram_app_missing_token(monkeypatch):
     """Verify exception raised when TELEGRAM_BOT_TOKEN is placeholder."""
+    monkeypatch.setattr(settings, "APP_ENV", "testing")
     monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "123456789:ABCplaceholder")
     with pytest.raises(ValueError, match="TELEGRAM_BOT_TOKEN is missing or placeholder"):
         build_telegram_app()
@@ -103,6 +104,7 @@ def test_get_job_inline_keyboard():
 
 def test_build_telegram_app_registers_milestone7_handlers(monkeypatch):
     """Verify status, deadlines, digest and callback handlers are properly registered."""
+    monkeypatch.setattr(settings, "APP_ENV", "testing")
     monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "123456789:AABBCCTestValidTokenString12345")
     app = build_telegram_app()
 
@@ -120,4 +122,29 @@ def test_build_telegram_app_registers_milestone7_handlers(monkeypatch):
     assert "deadlines" in command_handlers
     assert "digest" in command_handlers
     assert "tailor" in command_handlers
+    assert "watch" in command_handlers
+    assert "discover" in command_handlers
     assert has_callback_handler is True
+
+
+def test_background_scheduler_registers_jobs(monkeypatch):
+    """Tier 1: verify the 8AM digest, deadline sweep, and discovery sweep are armed."""
+    monkeypatch.setattr(settings, "APP_ENV", "testing")
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "123456789:AABBCCTestValidTokenString12345")
+    monkeypatch.setattr(settings, "SCHEDULER_ENABLED", True)
+    app = build_telegram_app()
+
+    job_names = [job.name for job in app.job_queue.jobs()]
+    assert "daily_digest" in job_names
+    assert "deadline_sweep" in job_names
+    assert "discovery_sweep" in job_names
+
+
+def test_scheduler_disabled_leaves_no_jobs(monkeypatch):
+    """Verify SCHEDULER_ENABLED=false registers zero background jobs."""
+    monkeypatch.setattr(settings, "APP_ENV", "testing")
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "123456789:AABBCCTestValidTokenString12345")
+    monkeypatch.setattr(settings, "SCHEDULER_ENABLED", False)
+    app = build_telegram_app()
+
+    assert len(app.job_queue.jobs()) == 0

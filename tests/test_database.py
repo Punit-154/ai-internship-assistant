@@ -1,11 +1,17 @@
 ﻿"""Tests for Database Operations, Deduplication, and Repositories."""
 
-from datetime import date
+from datetime import date, timedelta
 from sqlmodel import Session, select
 from src.database import (
+    add_watch_target,
+    deactivate_watch_target,
     find_existing_job,
     get_job_by_id,
+    get_jobs_needing_deadline_reminder,
+    has_scheduler_event,
     list_jobs,
+    list_watch_targets,
+    log_scheduler_event,
     purge_duplicate_jobs,
     save_job_posting,
     save_or_update_job_posting,
@@ -19,6 +25,7 @@ from src.models.job import (
     JobPosting,
     VerificationStatus,
 )
+from src.models.system import SchedulerEventType, SchedulerLog
 
 
 def test_save_raw_ingestion(session: Session):
@@ -139,3 +146,89 @@ def test_update_job_status(session: Session):
     updated = update_job_application_status(session, saved.id, ApplicationStatus.APPLIED)
     assert updated is not None
     assert updated.application_status == ApplicationStatus.APPLIED
+
+
+# ==============================================================================
+# Scheduler Log & Deadline Reminders
+# ==============================================================================
+
+def test_scheduler_log_idempotency(session: Session):
+    today = date.today()
+    assert has_scheduler_event(session, SchedulerEventType.DAILY_DIGEST, "digest", today) is False
+
+    log_scheduler_event(session, SchedulerEventType.DAILY_DIGEST, "digest", today)
+    assert has_scheduler_event(session, SchedulerEventType.DAILY_DIGEST, "digest", today) is True
+
+    log_scheduler_event(session, SchedulerEventType.DAILY_DIGEST, "digest", today)
+    logs = session.exec(select(SchedulerLog)).all()
+    assert len(logs) == 1
+
+    assert has_scheduler_event(session, SchedulerEventType.DAILY_DIGEST, "digest", today + timedelta(days=1)) is False
+
+
+def test_deadline_reminder_window_filters_and_dedupes(session: Session):
+    today = date.today()
+    urgent = JobPosting(
+        company_name="Stripe",
+        role_title="Machine Learning Intern",
+        application_deadline=today + timedelta(days=2),
+        application_status=ApplicationStatus.NEW,
+    )
+    applied = JobPosting(
+        company_name="Zoho",
+        role_title="SDE Intern",
+        application_deadline=today + timedelta(days=1),
+        application_status=ApplicationStatus.APPLIED,
+    )
+    far = JobPosting(
+        company_name="Google",
+        role_title="STEP Intern",
+        application_deadline=today + timedelta(days=10),
+        application_status=ApplicationStatus.NEW,
+    )
+    past = JobPosting(
+        company_name="Swiggy",
+        role_title="Backend Intern",
+        application_deadline=today - timedelta(days=1),
+        application_status=ApplicationStatus.NEW,
+    )
+    for j in (urgent, applied, far, past):
+        save_job_posting(session, j)
+
+    results = get_jobs_needing_deadline_reminder(session, window_days=2, ref_date=today)
+    ids = [j.id for j, _ in results]
+    assert urgent.id in ids
+    assert applied.id not in ids
+    assert far.id not in ids
+    assert past.id not in ids
+
+    log_scheduler_event(session, SchedulerEventType.DEADLINE_REMINDER, str(urgent.id), today)
+    results_after = get_jobs_needing_deadline_reminder(session, window_days=2, ref_date=today)
+    assert urgent.id not in [j.id for j, _ in results_after]
+
+
+# ==============================================================================
+# Watch Targets
+# ==============================================================================
+
+def test_add_and_list_watch_targets(session: Session):
+    t1 = add_watch_target(session, "Linear", "ashby", "linear")
+    assert t1.id is not None
+    assert t1.target_type.value == "ashby_board"
+    assert t1.active is True
+
+    add_watch_target(session, "Spotify", "lever", "spotify")
+    targets = list_watch_targets(session)
+    assert len(targets) == 2
+
+    deactivate_watch_target(session, t1.id)
+    assert len(list_watch_targets(session)) == 1
+    assert len(list_watch_targets(session, active_only=False)) == 2
+
+
+def test_add_watch_target_invalid_type_raises(session: Session):
+    import pytest
+    with pytest.raises(ValueError, match="Invalid watch type"):
+        add_watch_target(session, "X", "bamboohr", "x")
+    with pytest.raises(ValueError, match="Company name is required"):
+        add_watch_target(session, "  ", "lever", "x")

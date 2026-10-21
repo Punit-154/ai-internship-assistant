@@ -32,6 +32,22 @@ class ExtractedJobData(BaseModel):
     confidence_score: float = Field(ge=0.0, le=1.0, description="Confidence score from 0.0 to 1.0 based on how complete the posting is")
 
 
+class ExtractedJobBundleItem(BaseModel):
+    """One extracted job aligned to its input block index."""
+    index: int = Field(description="1-based index of the job block this extraction corresponds to")
+    data: ExtractedJobData
+
+
+class ExtractedJobBundle(BaseModel):
+    """Batch response covering every numbered job block in the input."""
+    jobs: List[ExtractedJobBundleItem] = Field(default_factory=list)
+
+
+class ExtractedJobsList(BaseModel):
+    """Loose multi-job extraction from one page: each item is a distinct posting."""
+    jobs: List[ExtractedJobData] = Field(default_factory=list)
+
+
 EXTRACTION_SYSTEM_INSTRUCTION = """
 You are a senior technical recruiter and extraction engine for student internship opportunities.
 Your task is to extract structured internship data from raw text or visual documents (screenshots, flyers, PDFs) with absolute fidelity and zero fabrication.
@@ -81,8 +97,25 @@ def generate_content_with_fallback(
             )
         except Exception as exc:
             err_str = str(exc)
-            if "429" in err_str or "404" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
-                logger.warning(f"Model {m} hit quota/availability limit ({exc}). Attempting fallback...")
+            is_transient = any(
+                term in err_str.lower()
+                for term in [
+                    "429",
+                    "503",
+                    "500",
+                    "404",
+                    "resource_exhausted",
+                    "unavailable",
+                    "high demand",
+                    "quota",
+                    "temporary",
+                    "deadline exceeded",
+                ]
+            )
+            if is_transient:
+                import time
+                logger.warning(f"Model {m} encountered transient/demand error ({exc}). Pausing briefly and attempting fallback...")
+                time.sleep(1.0)
                 last_exc = exc
                 continue
             raise
@@ -193,3 +226,93 @@ def extract_job_from_image(
     except Exception as exc:
         logger.error(f"Failed multimodal extraction with Gemini: {exc}")
         raise
+
+
+def extract_multiple_jobs_from_text(
+    blocks: List[str],
+    client: Optional[genai.Client] = None,
+    model_name: Optional[str] = None,
+) -> List[Optional[ExtractedJobData]]:
+    """Extract structured data for several job postings in ONE Gemini call.
+
+    Used by the discovery engine to enrich board listings cheaply. Each block
+    is one posting's text (title + description). Returns a list aligned with
+    `blocks`: element is the ExtractedJobData, or None if extraction failed
+    or the LLM omitted that index. Never raises — enrichment is best-effort.
+    """
+    if not blocks:
+        return []
+    try:
+        ai_client = client or get_genai_client()
+        target_model = model_name or settings.GEMINI_MODEL
+        numbered = "\n\n".join(
+            f"===== JOB BLOCK {i} =====\n{block[:4000]}"
+            for i, block in enumerate(blocks, start=1)
+        )
+        prompt = (
+            "Extract structured internship/job details for EACH numbered job block below. "
+            f"There are exactly {len(blocks)} blocks. Every entry in the output list "
+            "must include the block index it belongs to. Ground every field in the block "
+            "text; do not invent deadlines or links. If a block has no usable job posting, "
+            "still return its index with is_internship=false and empty skills.\n\n"
+            f"{numbered}"
+        )
+        response = generate_content_with_fallback(
+            client=ai_client,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=EXTRACTION_SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=ExtractedJobBundle,
+                temperature=0.1,
+            ),
+            model=target_model,
+        )
+        bundle = ExtractedJobBundle.model_validate_json(response.text)
+        by_index = {item.index: item.data for item in bundle.jobs}
+        return [by_index.get(i) for i in range(1, len(blocks) + 1)]
+    except Exception as exc:
+        logger.warning(f"Batch job extraction failed (returning None slots): {exc}")
+        return [None] * len(blocks)
+
+
+def extract_jobs_list_from_text(
+    page_text: str,
+    client: Optional[genai.Client] = None,
+    model_name: Optional[str] = None,
+    max_jobs: int = 10,
+) -> List[ExtractedJobData]:
+    """Extract ALL distinct job postings present in one scraped careers page.
+
+    Best-effort: returns an empty list on any failure instead of raising.
+    """
+    if not page_text or len(page_text.strip()) < 30:
+        return []
+    try:
+        ai_client = client or get_genai_client()
+        target_model = model_name or settings.GEMINI_MODEL
+        prompt = (
+            "The text below is a scraped careers/job-listings page that may contain "
+            f"multiple distinct job postings (at most {max_jobs} are relevant). Extract "
+            "every DISTINCT internship or entry-level student posting into the list, "
+            "one item per posting. Ground every field in the provided text; never invent "
+            "deadlines, companies, or links. Skip any posting clearly aimed at senior or "
+            "experienced professionals.\n\n"
+            f"{page_text[:15000]}"
+        )
+        response = generate_content_with_fallback(
+            client=ai_client,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=EXTRACTION_SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=ExtractedJobsList,
+                temperature=0.1,
+            ),
+            model=target_model,
+        )
+        parsed = ExtractedJobsList.model_validate_json(response.text)
+        return parsed.jobs[:max_jobs]
+    except Exception as exc:
+        logger.warning(f"Careers page listing extraction failed: {exc}")
+        return []

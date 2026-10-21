@@ -10,6 +10,7 @@ from sqlalchemy import func
 from sqlmodel import Session, SQLModel, create_engine, select
 from src.config import settings
 from src.models.job import ApplicationStatus, IngestionSource, JobPosting, RawIngestion
+from src.models.system import SchedulerEventType, SchedulerLog, WatchTarget, WatchTargetType
 
 
 def get_utc_now() -> datetime:
@@ -267,3 +268,163 @@ def purge_duplicate_jobs(session: Session) -> int:
     if purged_count > 0:
         session.commit()
     return purged_count
+
+
+# ==============================================================================
+# Scheduler Log (idempotency ledger for background jobs)
+# ==============================================================================
+
+def has_scheduler_event(
+    session: Session,
+    event_type: SchedulerEventType,
+    event_key: str,
+    sent_date: date,
+) -> bool:
+    """Check whether a background event was already delivered on a given date."""
+    stmt = select(SchedulerLog).where(
+        SchedulerLog.event_type == event_type,
+        SchedulerLog.event_key == event_key,
+        SchedulerLog.sent_date == sent_date,
+    )
+    return session.exec(stmt).first() is not None
+
+
+def log_scheduler_event(
+    session: Session,
+    event_type: SchedulerEventType,
+    event_key: str,
+    sent_date: date,
+    detail: Optional[str] = None,
+) -> None:
+    """Record that a background event was delivered on a date (idempotency marker)."""
+    if not has_scheduler_event(session, event_type, event_key, sent_date):
+        session.add(SchedulerLog(
+            event_type=event_type,
+            event_key=event_key,
+            sent_date=sent_date,
+            detail=detail,
+        ))
+        session.commit()
+
+
+# ==============================================================================
+# Deadline Reminder Sweep
+# ==============================================================================
+
+def get_jobs_needing_deadline_reminder(
+    session: Session,
+    window_days: int = 2,
+    ref_date: Optional[date] = None,
+) -> List[Tuple[JobPosting, int]]:
+    """Return unapplied (NEW/REVIEWED) jobs closing within `window_days`, with days left.
+
+    Jobs already reminded today are filtered out via the scheduler log.
+    """
+    today = ref_date or date.today()
+    cutoff = today + timedelta(days=window_days)
+
+    statement = (
+        select(JobPosting)
+        .where(
+            JobPosting.application_deadline != None,
+            JobPosting.application_deadline >= today,
+            JobPosting.application_deadline <= cutoff,
+            JobPosting.application_status.in_([ApplicationStatus.NEW, ApplicationStatus.REVIEWED]),
+        )
+        .order_by(JobPosting.application_deadline.asc())
+    )
+    results: List[Tuple[JobPosting, int]] = []
+    for job in session.exec(statement).all():
+        if has_scheduler_event(session, SchedulerEventType.DEADLINE_REMINDER, str(job.id), today):
+            continue
+        results.append((job, max(0, (job.application_deadline - today).days)))
+    return results
+
+
+# ==============================================================================
+# Watch Target CRUD (Proactive Discovery)
+# ==============================================================================
+
+_VALID_WATCH_TYPES = {t.value: t for t in WatchTargetType}
+_WATCH_TYPE_ALIASES = {
+    "ashby": WatchTargetType.ASHBY_BOARD,
+    "greenhouse": WatchTargetType.GREENHOUSE_BOARD,
+    "gh": WatchTargetType.GREENHOUSE_BOARD,
+    "lever": WatchTargetType.LEVER_BOARD,
+    "url": WatchTargetType.CUSTOM_URL,
+    "custom": WatchTargetType.CUSTOM_URL,
+}
+
+
+def add_watch_target(
+    session: Session,
+    company_name: str,
+    target_type: Union[WatchTargetType, str],
+    target_key: str,
+    notes: Optional[str] = None,
+) -> WatchTarget:
+    """Register a new ATS board / careers URL under discovery surveillance."""
+    if isinstance(target_type, str):
+        cleaned = target_type.strip().lower().replace("-", "_")
+        resolved = _WATCH_TYPE_ALIASES.get(cleaned) or _VALID_WATCH_TYPES.get(cleaned)
+        if not resolved:
+            raise ValueError(
+                f"Invalid watch type '{target_type}'. "
+                f"Allowed shorthands: {', '.join(_WATCH_TYPE_ALIASES)}"
+            )
+        target_type = resolved
+
+    if not company_name or not company_name.strip():
+        raise ValueError("Company name is required for a watch target.")
+    if not target_key or not target_key.strip():
+        raise ValueError("Target key (board slug or URL) is required for a watch target.")
+
+    target = WatchTarget(
+        company_name=company_name.strip(),
+        target_type=target_type,
+        target_key=target_key.strip(),
+        active=True,
+        notes=notes,
+    )
+    session.add(target)
+    session.commit()
+    session.refresh(target)
+    return target
+
+
+def list_watch_targets(session: Session, active_only: bool = True) -> List[WatchTarget]:
+    """Return registered watch targets, optionally filtering to active only."""
+    statement = select(WatchTarget).order_by(WatchTarget.id.asc())
+    targets = list(session.exec(statement).all())
+    if active_only:
+        targets = [t for t in targets if t.active]
+    return targets
+
+
+def deactivate_watch_target(session: Session, target_id: int) -> Optional[WatchTarget]:
+    """Soft-delete a watch target (keeps history; discovery skips deactivated ones)."""
+    target = session.get(WatchTarget, target_id)
+    if not target:
+        return None
+    target.active = False
+    session.add(target)
+    session.commit()
+    session.refresh(target)
+    return target
+
+
+def touch_watch_target(
+    session: Session,
+    target_id: int,
+    error: Optional[str] = None,
+) -> Optional[WatchTarget]:
+    """Record a completed poll attempt against a watch target (success or error)."""
+    target = session.get(WatchTarget, target_id)
+    if not target:
+        return None
+    target.last_checked_at = get_utc_now()
+    target.last_error = error
+    session.add(target)
+    session.commit()
+    session.refresh(target)
+    return target

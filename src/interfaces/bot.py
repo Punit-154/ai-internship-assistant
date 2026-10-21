@@ -11,12 +11,13 @@ Provides mobile ingestion and control:
 - Includes robust HTTP timeouts and resilient error handling
 """
 
+import asyncio
 import html
 import logging
 import re
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
-from typing import Optional
-from datetime import date
+from typing import List, Optional, Tuple
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import NetworkError, TimedOut
@@ -31,13 +32,28 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 from src.config import settings
-from src.database import get_expired_deadlines, get_job_by_id, get_jobs_by_status, get_session, get_upcoming_deadlines, list_jobs, update_job_application_status
+from src.database import (
+    add_watch_target,
+    deactivate_watch_target,
+    get_expired_deadlines,
+    get_job_by_id,
+    get_jobs_by_status,
+    get_jobs_needing_deadline_reminder,
+    get_session,
+    get_upcoming_deadlines,
+    init_db,
+    list_jobs,
+    list_watch_targets,
+    log_scheduler_event,
+    update_job_application_status,
+)
 from src.models.job import (
     EligibilityStatus,
     IngestionSource,
     JobPosting,
     VerificationStatus,
 )
+from src.models.system import SchedulerEventType, WatchTargetType
 from src.services.pipeline import (
     process_image_pipeline,
     process_text_pipeline,
@@ -48,7 +64,17 @@ from src.services.profile import (
     get_candidate_profile,
     parse_project_from_text,
 )
-from src.services.digest import build_daily_digest, format_digest_html
+from src.services.digest import (
+    build_daily_digest,
+    format_deadline_reminder_html,
+    format_digest_html,
+)
+from src.services.discovery import (
+    fetch_target_listings,
+    is_alertable,
+    is_internship_title,
+    run_discovery,
+)
 from src.services.resume import tailor_resume_for_job
 from src.services.github_service import extract_github_repo_coords, ingest_github_project, save_project_to_knowledge_base
 
@@ -173,7 +199,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status &lt;id&gt; &lt;status&gt; - Update job application status\n"
         "/deadlines - View approaching deadlines\n"
         "/digest - View daily intelligence briefing\n"
-        "/help - Show this guidance message"
+        "/watch - Manage automatic discovery boards (new!)\n"
+        "/discover - Run a discovery sweep right now (new!)\n"
+        "/help - Show this guidance message\n\n"
+        f"<i>Auto-scheduled:</i> 🌅 digest at {settings.DIGEST_HOUR_LOCAL:02d}:00 local"
+        f" every day, ⏰ deadline reminders every {settings.DEADLINE_CHECK_INTERVAL_HOURS}h,"
+        f" 🛰️ watchlist sweep every {settings.DISCOVERY_CHECK_INTERVAL_HOURS}h."
     )
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
 
@@ -458,6 +489,335 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await status_msg.edit_text(f"❌ Failed to build daily digest: {html.escape(str(exc))}")
 
 
+# ==============================================================================
+# Background Scheduler (Tier 1: real 8AM digest + deadline reminders + discovery)
+# ==============================================================================
+
+def get_target_chat_id() -> Optional[int]:
+    """Resolve the private chat used for scheduled pushes (= whitelisted user id)."""
+    return settings.TELEGRAM_ALLOWED_USER_ID
+
+
+def _sync_build_digest_html() -> str:
+    """Blocking digest build for asyncio.to_thread (reads/writes DB)."""
+    with get_session() as session:
+        report = build_daily_digest(session)
+        digest_html = format_digest_html(report)
+        log_scheduler_event(session, SchedulerEventType.DAILY_DIGEST, "digest", date.today())
+        return digest_html
+
+
+def _sync_collect_deadline_reminders() -> List[Tuple[JobPosting, int]]:
+    with get_session() as session:
+        pairs = get_jobs_needing_deadline_reminder(
+            session, window_days=settings.DEADLINE_REMINDER_WINDOW_DAYS
+        )
+        return [(job, days) for job, days in pairs]
+
+
+def _sync_mark_reminders_sent(pairs: List[Tuple[JobPosting, int]]) -> None:
+    with get_session() as session:
+        for job, _days in pairs:
+            log_scheduler_event(session, SchedulerEventType.DEADLINE_REMINDER, str(job.id), date.today())
+
+
+def _sync_run_discovery() -> Tuple[list, int]:
+    """Blocking discovery run for asyncio.to_thread; returns (new outcomes, target count)."""
+    with get_session() as session:
+        targets = list_watch_targets(session, active_only=True)
+        outcomes = run_discovery(session)
+        return outcomes, len(targets)
+
+
+async def scheduled_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback: deliver the morning intelligence briefing (8AM local)."""
+    if not settings.SCHEDULER_ENABLED:
+        return
+    chat_id = get_target_chat_id()
+    if not chat_id:
+        logger.warning("[Scheduler] Daily digest skipped: TELEGRAM_ALLOWED_USER_ID is unset.")
+        return
+    try:
+        digest_html = await asyncio.to_thread(_sync_build_digest_html)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=digest_html,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.error(f"[Scheduler] Daily digest failed: {exc}")
+
+
+async def scheduled_deadline_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback: sweep for unapplied opportunities closing soon; push once per day."""
+    if not settings.SCHEDULER_ENABLED:
+        return
+    chat_id = get_target_chat_id()
+    if not chat_id:
+        return
+    try:
+        pairs = await asyncio.to_thread(_sync_collect_deadline_reminders)
+        if not pairs:
+            return
+        reminder_text = format_deadline_reminder_html(pairs)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=reminder_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        await asyncio.to_thread(_sync_mark_reminders_sent, pairs)
+    except Exception as exc:
+        logger.error(f"[Scheduler] Deadline reminder sweep failed: {exc}")
+
+
+async def scheduled_discovery_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback: poll watch targets and push alert-worthy new postings."""
+    if not settings.SCHEDULER_ENABLED or not settings.DISCOVERY_ENABLED:
+        return
+    chat_id = get_target_chat_id()
+    if not chat_id:
+        logger.warning("[Scheduler] Discovery skipped: TELEGRAM_ALLOWED_USER_ID is unset.")
+        return
+    try:
+        outcomes, target_count = await asyncio.to_thread(_sync_run_discovery)
+        if not outcomes:
+            return
+        alertable = [o for o in outcomes if is_alertable(o)]
+        silent = len(outcomes) - len(alertable)
+        for outcome in alertable:
+            job = outcome.job
+            card = (
+                "🛰️ <b>NEW OPPORTUNITY DISCOVERED</b>\n\n"
+                f"{format_job_html_card(job)}"
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=card,
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_job_inline_keyboard(job.id, application_url=job.application_url),
+                disable_web_page_preview=True,
+            )
+        summary = (
+            f"🛰️ Discovery sweep checked {target_count} watch target(s): "
+            f"{len(alertable)} alert-worthy new posting(s) pushed above"
+            + (f", {silent} lower-match posting(s) saved silently." if silent else ".")
+        )
+        await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logger.error(f"[Scheduler] Discovery sweep failed: {exc}")
+
+
+def schedule_background_jobs(application: Application) -> None:
+    """Register steady-state background jobs on the PTB JobQueue.
+
+    - Daily digest at DIGEST_HOUR_LOCAL (Kolkata tz by default)
+    - Deadline reminder sweep every DEADLINE_CHECK_INTERVAL_HOURS
+    - Watchlist discovery sweep every DISCOVERY_CHECK_INTERVAL_HOURS
+    """
+    if not settings.SCHEDULER_ENABLED:
+        logger.info("[Scheduler] Background scheduling disabled (SCHEDULER_ENABLED=false).")
+        return
+    if application.job_queue is None:
+        logger.warning(
+            "[Scheduler] JobQueue unavailable — install the job-queue extra: "
+            'pip install "python-telegram-bot[job-queue]"'
+        )
+        return
+
+    local_tz = timezone(timedelta(hours=settings.TZ_OFFSET_HOURS))
+    application.job_queue.run_daily(
+        scheduled_daily_digest,
+        time=dt_time(hour=settings.DIGEST_HOUR_LOCAL, tzinfo=local_tz),
+        name="daily_digest",
+    )
+    application.job_queue.run_repeating(
+        scheduled_deadline_check,
+        interval=settings.DEADLINE_CHECK_INTERVAL_HOURS * 3600,
+        first=180,
+        name="deadline_sweep",
+    )
+    application.job_queue.run_repeating(
+        scheduled_discovery_check,
+        interval=settings.DISCOVERY_CHECK_INTERVAL_HOURS * 3600,
+        first=90,
+        name="discovery_sweep",
+    )
+    print(f"[*] Scheduler armed: digest at {settings.DIGEST_HOUR_LOCAL:02d}:00 local | "
+          f"deadline sweep every {settings.DEADLINE_CHECK_INTERVAL_HOURS}h | "
+          f"discovery sweep every {settings.DISCOVERY_CHECK_INTERVAL_HOURS}h")
+
+
+# ==============================================================================
+# Watchlist & Discovery Commands
+# ==============================================================================
+
+def _board_browser_url(target) -> str:
+    """Human-browsable URL for a watch target (for display in /watch list)."""
+    k = target.target_key
+    return {
+        WatchTargetType.ASHBY_BOARD: f"https://jobs.ashbyhq.com/{k}",
+        WatchTargetType.GREENHOUSE_BOARD: f"https://boards.greenhouse.io/{k}",
+        WatchTargetType.LEVER_BOARD: f"https://jobs.lever.co/{k}",
+        WatchTargetType.CUSTOM_URL: k,
+    }.get(target.target_type, k)
+
+
+async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /watch add|list|remove — manage the ATS board discovery watchlist."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "🛰️ <b>Watchlist — Proactive Job Discovery</b>\n\n"
+            "I automatically poll these boards and push new intern postings to you:\n\n"
+            "<b>Usage:</b>\n"
+            "• <code>/watch add ashby &lt;board_slug&gt; [Company]</code>\n"
+            "• <code>/watch add greenhouse &lt;token&gt; [Company]</code>\n"
+            "• <code>/watch add lever &lt;slug&gt; [Company]</code>\n"
+            "• <code>/watch add url &lt;careers_page_url&gt; [Company]</code>\n"
+            "• <code>/watch list</code> — show targets & status\n"
+            "• <code>/watch remove &lt;id&gt;</code> — stop watching\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/watch add lever spotify</code>\n"
+            "• <code>/watch add greenhouse stripe Stripe</code>\n"
+            "• <code>/watch add ashby linear</code>",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    action = args[0].lower()
+
+    if action == "list":
+        with get_session() as session:
+            targets = list_watch_targets(session, active_only=False)
+            if not targets:
+                await update.message.reply_text("🛰️ Watchlist empty. Add one with <code>/watch add lever spotify</code>", parse_mode=ParseMode.HTML)
+                return
+            lines = ["🛰️ <b>Watch Targets:</b>\n"]
+            active_targets = [t for t in targets if t.active]
+            for t in targets:
+                status_icon = "✅" if t.active else "🚫"
+                checked = t.last_checked_at.strftime("%b %d %H:%M") if t.last_checked_at else "never"
+                err = f" ⚠️ <i>{html.escape(t.last_error[:60])}</i>" if t.last_error else ""
+                lines.append(
+                    f"{status_icon} <b>#{t.id} {html.escape(t.company_name)}</b> "
+                    f"(<code>{t.target_type.value.split('_')[0]}:{html.escape(t.target_key[:24])}</code>)\n"
+                    f"    🔗 {_board_browser_url(t)}\n"
+                    f"    🕒 last checked: {checked} UTC{err}"
+                )
+            lines.append(f"\nActive: <b>{len(active_targets)}</b> of {len(targets)} targets | Manual check: /discover")
+            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+
+    if action == "add":
+        if len(args) < 3:
+            await update.message.reply_text("💡 Usage: <code>/watch add &lt;ashby|greenhouse|lever|url&gt; &lt;key&gt; [Company]</code>", parse_mode=ParseMode.HTML)
+            return
+        watch_type, key = args[1].lower(), args[2].strip()
+        company_label = " ".join(args[3:]).strip() or key.replace("-", " ").title()
+
+        if watch_type in {"url", "custom"} and not key.startswith(("http://", "https://")):
+            key = "https://" + key.lstrip("/")
+
+        with get_session() as session:
+            try:
+                target = add_watch_target(session, company_label, watch_type, key)
+            except ValueError as exc:
+                await update.message.reply_text(f"❌ {html.escape(str(exc))}")
+                return
+
+            probe_msg = await update.message.reply_text(
+                f"🛰️ <b>Target #{target.id} saved.</b> Verifying the board is reachable...",
+                parse_mode=ParseMode.HTML,
+            )
+            try:
+                listings = await asyncio.to_thread(fetch_target_listings, target)
+                intern_count = sum(1 for l in listings if is_internship_title(l.title))
+                await probe_msg.edit_text(
+                    f"✅ <b>Watching {html.escape(target.company_name)}</b> (#{target.id})\n"
+                    f"🔗 {_board_browser_url(target)}\n"
+                    f"📊 Live postings on board right now: <b>{len(listings)}</b>"
+                    + (f" (≈{intern_count} intern/trainee roles)" if intern_count else "")
+                    + "\n\n<i>New internship postings will be pushed automatically. Manual check anytime: /discover</i>",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception as exc:
+                await probe_msg.edit_text(
+                    f"⚠️ <b>Target #{target.id} saved, but the board check FAILED:</b>\n"
+                    f"<code>{html.escape(str(exc)[:200])}</code>\n\n"
+                    "<i>Double-check the slug/token (open the board in a browser). Discovery will keep"
+                    " retrying in the background — /watch list shows the last error.</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+        return
+
+    if action == "remove":
+        if len(args) < 2 or not args[1].isdigit():
+            await update.message.reply_text("💡 Usage: <code>/watch remove &lt;id&gt;</code> (see /watch list)", parse_mode=ParseMode.HTML)
+            return
+        target_id = int(args[1])
+        with get_session() as session:
+            target = deactivate_watch_target(session, target_id)
+            if target:
+                await update.message.reply_text(f"🚫 Stopped watching <b>{html.escape(target.company_name)}</b> (#{target.id}).", parse_mode=ParseMode.HTML)
+            else:
+                await update.message.reply_text(f"❌ Watch target #{target_id} not found.", parse_mode=ParseMode.HTML)
+        return
+
+    await update.message.reply_text("❓ Unknown action. Use <code>/watch add|list|remove</code>.", parse_mode=ParseMode.HTML)
+
+
+async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /discover — run one discovery sweep across the watchlist right now."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    status_msg = await update.message.reply_text(
+        "🛰️ <i>Checking your watchlist boards for new internship postings...</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        outcomes, target_count = await asyncio.to_thread(_sync_run_discovery)
+    except Exception as exc:
+        logger.error(f"Discovery command failed: {exc}")
+        await status_msg.edit_text(f"❌ Discovery failed: {html.escape(str(exc))}", parse_mode=ParseMode.HTML)
+        return
+
+    alertable = [o for o in outcomes if is_alertable(o)]
+    silent = len(outcomes) - len(alertable)
+
+    if not outcomes:
+        await status_msg.edit_text(
+            f"🛰️ <b>Sweep complete:</b> {target_count} watch target(s) checked.\n"
+            "<i>No new internship postings found right now.</i>",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    for outcome in alertable:
+        job = outcome.job
+        card = "🛰️ <b>NEW OPPORTUNITY DISCOVERED</b>\n\n" + format_job_html_card(job)
+        await update.message.reply_text(
+            card,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_job_inline_keyboard(job.id, application_url=job.application_url),
+            disable_web_page_preview=True,
+        )
+    summary = (
+        f"🛰️ <b>Sweep complete:</b> {len(outcomes)} new posting(s) ingested from "
+        f"{target_count} watch target(s) — {len(alertable)} pushed above"
+        + (f", {silent} lower-match saved silently (see /list)." if silent else ".")
+    )
+    await update.message.reply_text(summary, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle interactive button clicks from job cards."""
     query = update.callback_query
@@ -706,6 +1066,8 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("deadlines", cmd_deadlines))
     app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("watch", cmd_watch))
+    app.add_handler(CommandHandler("discover", cmd_discover))
 
     # Inline Keyboard Button Clicks
     app.add_handler(CallbackQueryHandler(handle_callback_query))
@@ -715,15 +1077,24 @@ def build_telegram_app() -> Application:
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
 
+    # Ensure auxiliary tables (scheduler_log, watch_targets) exist before jobs run
+    if not settings.is_testing():
+        init_db()
+
+    # Background scheduler: 8AM digest + deadline reminders + discovery sweeps
+    schedule_background_jobs(app)
+
     return app
 
 
 def run_telegram_bot() -> None:
-    """Start the Telegram bot using long polling."""
+    """Start the Telegram bot using long polling with the background scheduler armed."""
     print("[*] Starting Telegram Bot with long polling...")
     print(f"[*] Whitelisted Telegram User ID: {settings.TELEGRAM_ALLOWED_USER_ID or 'All (Warning: Open)'}")
     print("[*] Resilient HTTP timeouts: 30s connect / 30s read")
     print("[*] Resume Tailoring enabled (/tailor <id>)")
+    print("[*] Background jobs: 8AM digest | deadline reminders | watchlist discovery")
+    print("    Manage boards with /watch | manual sweep with /discover")
     app = build_telegram_app()
     app.run_polling(drop_pending_updates=True)
 
