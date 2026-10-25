@@ -174,7 +174,7 @@ or URL), `active`, `last_checked_at`, `last_error`, `notes`. CRUD helpers live i
 
 ### JSON storage (not in DB)
 
-**`data/candidate_profile.json`** — `CandidateProfile`: identity, academics (CGPA 8.5,
+**`data/candidate_profile.json`** — `CandidateProfile`: identity, academics (CGPA,
 grad 2028), contact links, `target_roles`, availability (`Remote` during semester),
 `summer_locations` (Bangalore/Chennai/Hyderabad), `verified_skills` (~50 entries),
 `verified_projects` (list of `ProjectItem`: title, tech_stack, description, github_url,
@@ -201,7 +201,9 @@ Resolution order (first win returns):
    with `trafilatura.baseline` fallback, discarded under the 50-char threshold)
 6. **`_playwright_fetch` retry** — on thin SPA shells (HTTP <400, tiny text) or bot-challenge
    statuses (401/403/429/503): headless Chromium renders the page (images/media/fonts blocked),
-   `wait_for_load_state("networkidle")` up to 4s, same 50-char quality gate as HTTP
+   settles via a short `networkidle` window **plus** explicit waits for hydration-dependent
+   job-content selectors (`data-automation-id="jobDescription…"`, `main`, `[role="main"]` …
+   — `networkidle` alone is insufficient on angular Workday apps), same 50-char quality gate as HTTP
 7. **`_search_grounding_fallback`** — on anything still failing (incl. HTTP ≥400, timeout,
    network error): builds a DDGS query from URL segments, returns combined snippets as
    synthetic "text"
@@ -582,8 +584,8 @@ python -c "from src.database import get_session, purge_duplicate_jobs; s=next(ge
 | `GEMINI_MODEL` | all LLM calls | Defaults `gemini-3.5-flash`; fallback chain still applies |
 | `TELEGRAM_BOT_TOKEN` | bot | ValueError at startup |
 | `TELEGRAM_ALLOWED_USER_ID` | bot auth | ⚠️ Bot becomes open to everyone |
-| `DATABASE_URL` | database | Defaults `REDACTED` |
-| `APP_ENV` | config helpers (tests set `testing`) | Defaults `REDACTED` |
+| `DATABASE_URL` | database | Defaults `sqlite:///internships.db` |
+| `APP_ENV` | config helpers (tests set `testing`) | Defaults `development` |
 | `SCHEDULER_ENABLED` | bot `schedule_background_jobs` | Defaults `true`; `false` = no background jobs |
 | `DIGEST_HOUR_LOCAL` | bot `run_daily` | Defaults `8` (local tz) |
 | `TZ_OFFSET_HOURS` | bot scheduler tz | Defaults `5.5` (IST) |

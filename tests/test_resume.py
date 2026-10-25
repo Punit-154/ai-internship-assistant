@@ -126,7 +126,7 @@ def test_ats_keyword_extraction_and_audit():
         role_title="Backend Software Engineering Intern",
         required_skills=["Python", "FastAPI", "PostgreSQL"],
         preferred_skills=["Docker", "Kafka"],
-        notes="Microservices and REST APIs REDACTED",
+        notes="Microservices and REST APIs developed",
     )
     kws = extract_ats_keywords_from_job(job)
     assert "Python" in kws

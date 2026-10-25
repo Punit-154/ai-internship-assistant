@@ -19,11 +19,11 @@ class Settings(BaseSettings):
     UPLOAD_DIR: Path = Path(__file__).resolve().parent.parent / "data" / "uploads"
 
     # Environment
-    APP_ENV: str = Field(default="REDACTED", description="Runtime environment: REDACTED, testing, production")
+    APP_ENV: str = Field(default="development", description="Runtime environment: development, testing, production")
 
     # Database
     DATABASE_URL: str = Field(
-        default="REDACTED",
+        default="sqlite:///internships.db",
         description="SQLAlchemy database connection URI (defaults to SQLite)"
     )
 

@@ -16,7 +16,7 @@ class ProjectItem(BaseModel):
     description: str = Field(description="Concise, impact-oriented summary of what the project does")
     github_url: Optional[str] = Field(default=None, description="GitHub repository URL if available")
     live_demo_url: Optional[str] = Field(default=None, description="Live deployed URL or demo link if available")
-    date_range: Optional[str] = Field(default=None, description="Project REDACTED date range (e.g., 'Aug 2026 - Sep 2026')")
+    date_range: Optional[str] = Field(default=None, description="Project duration date range (e.g., 'Aug 2026 - Sep 2026')")
     bullet_points: List[str] = Field(default_factory=list, description="Detailed verified bullet points describing accomplishments")
 
 
@@ -31,14 +31,14 @@ class CandidateProfile(BaseModel):
     current_college_year: int = Field(default=3, description="Current year of study (3rd Year / Pre-final)")
     graduation_year: int = Field(default=2028, description="Target graduation year")
     education_dates: str = Field(default="Aug 2024 - Aug 2028 (Expected)", description="Duration of academic program")
-    cgpa: Optional[float] = Field(default=9.22, description="Academic CGPA")
+    cgpa: Optional[float] = Field(default=8.5, description="Academic CGPA")
     email: Optional[str] = Field(default="you@example.com", description="Candidate contact email")
     phone: Optional[str] = Field(default="+91 0000000000", description="Candidate contact phone number")
     linkedin_url: Optional[str] = Field(default="https://linkedin.com/in/your-handle", description="Candidate LinkedIn URL")
-    github_url: Optional[str] = Field(default="https://github.com/Punit-154", description="Candidate GitHub URL")
+    github_url: Optional[str] = Field(default="https://github.com/your-handle", description="Candidate GitHub URL")
     portfolio_url: Optional[str] = Field(default="https://your-portfolio.example.com", description="Candidate portfolio website URL")
     summary: Optional[str] = Field(
-        default="Computer Science undergraduate (CGPA 8.5/10.0) seeking Software Engineering Intern and Cloud/DevOps Intern roles. Proficient in Python, Amazon Web Services (AWS), and FastAPI, with hands-on experience building scalable RESTful APIs and Generative AI / Retrieval-Augmented Generation (RAG) applications.",
+        default="Computer Science undergraduate seeking Software Engineering Intern and Cloud/DevOps Intern roles. Proficient in Python, Amazon Web Services (AWS), and FastAPI, with hands-on experience building scalable RESTful APIs and Generative AI / Retrieval-Augmented Generation (RAG) applications.",
         description="Professional summary",
     )
 

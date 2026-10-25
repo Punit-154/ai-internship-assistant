@@ -179,7 +179,7 @@ Edit `.env`:
 GEMINI_API_KEY=your_gemini_api_key_here
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 TELEGRAM_ALLOWED_USER_ID=your_numeric_telegram_user_id
-DATABASE_URL=REDACTED
+DATABASE_URL=sqlite:///internships.db
 ```
 
 > **Note:** To find your Telegram user ID, send `/start` to `@userinfobot` on Telegram.
@@ -199,7 +199,7 @@ The assistant includes a full-featured CLI for terminal workflows:
 |---|---|---|
 | `init-db` | Initializes SQLite schema and tables | `python -m src.interfaces.cli init-db` |
 | `show-profile` | Displays verified skills, academic details, and projects | `python -m src.interfaces.cli show-profile` |
-| `update-profile` | Updates specific profile attributes | `python -m src.interfaces.cli update-profile --key cgpa --value "9.22"` |
+| `update-profile` | Updates specific profile attributes | `python -m src.interfaces.cli update-profile --key cgpa --value "8.5"` |
 | `add-project` | Ingests project from GitHub URL or text snippet | `python -m src.interfaces.cli add-project https://github.com/Punit-154/Reco.ai` |
 | `extract-url` | Scrapes and extracts an opportunity from a URL | `python -m src.interfaces.cli extract-url "https://jobs.lever.co/company/role"` |
 | `extract-text` | Ingests raw job description text | `python -m src.interfaces.cli extract-text "Looking for SWE intern..."` |

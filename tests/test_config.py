@@ -11,7 +11,7 @@ def test_default_settings(monkeypatch):
     monkeypatch.delenv("TELEGRAM_ALLOWED_USER_ID", raising=False)
 
     s = Settings()
-    assert s.APP_ENV == "REDACTED"
+    assert s.APP_ENV == "development"
     assert s.CANDIDATE_GRAD_YEAR == 2028
     assert s.CANDIDATE_COLLEGE == "VIT Chennai"
     assert s.DATABASE_URL.startswith("sqlite")

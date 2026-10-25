@@ -30,7 +30,7 @@ Features JWT authentication, owner-scoped querysets, problem filtering, search, 
 - **Aggregated Analytics**:
   - Dedicated `/api/attempts/stats/` endpoint computed with ORM aggregation (`annotate`, `Count`, `Sum`) to report solved counts per topic, difficulty breakdowns, and total practice time.
 - **Database & Deployment**:
-  - SQLite for local REDACTED, with support for PostgreSQL via `dj-database-url`.
+  - SQLite for local development, with support for PostgreSQL via `dj-database-url`.
   - Static files served via WhiteNoise.
   - Deployment configuration for Render (`render.yaml`, `build.sh`, `Procfile`).
 - **Interactive Documentation**:
