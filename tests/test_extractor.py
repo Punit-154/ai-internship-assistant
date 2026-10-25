@@ -14,11 +14,15 @@ from src.services.extractor import (
 )
 
 
-def test_validate_gemini_api_key_accepts_real_format():
-    """A correctly shaped AI Studio key (AIzaSy..., ~39 chars) passes validation."""
-    key = "AIzaSy" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
-    assert len(key) >= 30
-    assert validate_gemini_api_key(key) == key
+def test_validate_gemini_api_key_accepts_real_formats():
+    """Classic AIzaSy keys and new AQ.-format keys both pass validation."""
+    classic = "AIzaSy" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    assert len(classic) >= 40
+    assert validate_gemini_api_key(classic) == classic
+
+    new_format = "AQ." + "Ab8RN6IDXgJWx_buCzuByRh5ulQsZAFxG0Dnvv1cloY2rQb1BBA"
+    assert len(new_format) >= 53
+    assert validate_gemini_api_key(new_format) == new_format
 
 
 def test_validate_gemini_api_key_rejects_placeholder_and_empty():
@@ -29,13 +33,15 @@ def test_validate_gemini_api_key_rejects_placeholder_and_empty():
         validate_gemini_api_key(None)
 
 
-def test_validate_gemini_api_key_rejects_access_token():
-    """Gemini CLI access tokens ('AQ.Ab8...') must fail fast with actionable guidance."""
-    token = "AQ.Ab8" + "x" * 47  # 53-char token, exactly the format that triggered 401s
-    with pytest.raises(ValueError, match="AI Studio API key"):
-        validate_gemini_api_key(token)
-    with pytest.raises(ValueError, match="aistudio.google.com"):
-        validate_gemini_api_key(token)
+def test_validate_gemini_api_key_rejects_truncated_and_garbled():
+    """Truncated keys (missing 'AQ.' prefix) and short garbage must fail fast."""
+    truncated = "Ab8RN6IDXgJWx_buCzuByRh5ulQsZAFxG0Dnvv1cloY2rQb1BBA"  # 50 chars, no AQ. prefix
+    with pytest.raises(ValueError, match="AQ\\."):
+        validate_gemini_api_key(truncated)
+    with pytest.raises(ValueError, match="valid AI Studio API key"):
+        validate_gemini_api_key("AQ.Ab8RN6")  # right prefix, way too short
+    with pytest.raises(ValueError, match="valid AI Studio API key"):
+        validate_gemini_api_key("short-key-1234567890")
 
 
 def test_extracted_job_data_model():

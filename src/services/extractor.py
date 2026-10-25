@@ -126,18 +126,21 @@ def generate_content_with_fallback(
     raise last_exc
 
 
-AI_STUDIO_KEY_PREFIX = "AIza"
-AI_STUDIO_KEY_MIN_LEN = 30
+AI_STUDIO_KEY_PREFIXES = ("AIza", "AQ.")
+AI_STUDIO_KEY_MIN_LEN = 40
+AQ_KEY_MIN_LEN = 53
 
 
 def validate_gemini_api_key(api_key: Optional[str]) -> str:
     """Reject credential types the Generative Language API cannot accept.
 
-    Real AI Studio API keys start with 'AIza' and are ~39 characters long.
-    Anything else (e.g. Gemini CLI access tokens starting 'AQ.', OAuth tokens,
-    or truncated strings) reaches the API and fails with an opaque
-    401 UNAUTHENTICATED / ACCESS_TOKEN_TYPE_UNSUPPORTED — fail fast instead
-    with instructions pointing at the key-generation page.
+    Two real AI Studio formats exist:
+    - Classic keys: 'AIzaSy...' (~39 chars)
+    - New-format keys: 'AQ.Ab8...' (~53 chars, issued via projects/; the
+      Generative Language API still accepts them as API-key credentials)
+    Anything shorter or with an unrecognized prefix fails loudly with
+    instructions — the API's raw errors for these are opaque 401/400 text
+    (e.g. truncated 'AQ.'-keys lose their token-type marker and 400).
     """
     if not api_key or api_key.startswith("AIzaSy_your_gemini"):
         raise ValueError(
@@ -145,15 +148,17 @@ def validate_gemini_api_key(api_key: Optional[str]) -> str:
             "Get a free API key at https://aistudio.google.com/apikey "
             "and set GEMINI_API_KEY=<AIzaSy...> in .env"
         )
-    if not api_key.startswith(AI_STUDIO_KEY_PREFIX) or len(api_key) < AI_STUDIO_KEY_MIN_LEN:
+    is_classic = api_key.startswith("AIza") and len(api_key) >= AI_STUDIO_KEY_MIN_LEN
+    is_new_format = api_key.startswith("AQ.") and len(api_key) >= AQ_KEY_MIN_LEN
+    if not (is_classic or is_new_format):
         head = api_key[:5] + "..."
         raise ValueError(
-            f"GEMINI_API_KEY does not look like an AI Studio API key "
+            f"GEMINI_API_KEY does not look like a valid AI Studio API key "
             f"(got {len(api_key)} chars starting '{head}').\n"
-            "AI Studio keys start with 'AIza'. Access tokens (starting 'AQ.') are "
-            "NOT supported by this API.\n"
-            "Create an API key at https://aistudio.google.com/apikey and "
-            "set GEMINI_API_KEY=<AIzaSy...> in .env"
+            "Valid formats: 'AIzaSy...' (classic) or 'AQ.Ab8...' (new). "
+            "If your key starts 'AQ.' make sure the whole token was copied —\n"
+            "the leading 'AQ.' is required. Use the 'Copy key' button at "
+            "https://aistudio.google.com/apikey and re-paste into .env"
         )
     return api_key
 
