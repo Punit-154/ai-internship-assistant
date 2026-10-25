@@ -77,7 +77,7 @@ or the GitHub knowledge base in `data/projects/`.
 
 **A. URL pipeline** — `process_url_pipeline(session, url)` in `src/services/pipeline.py:100`
 1. Log raw URL to `raw_ingestions`
-2. `scrape_url()` → tries ATS APIs → httpx → DuckDuckGo fallback
+2. `scrape_url()` → tries ATS APIs → Workday straight to headless Chromium → httpx → Chromium retry on thin shell / 403 → DuckDuckGo fallback
 3. `extract_job_from_text()` → structured `ExtractedJobData`
 4. `verify_opportunity()` → trust verdict; if it finds an official portal URL, that **overrides** the scraped URL
 5. `evaluate_job_match()` → score + skill match/gap lists
@@ -106,7 +106,7 @@ match/save steps as B.
 | `src/models/system.py` | `SchedulerLog` (idempotency ledger) + `WatchTarget` (board watchlist) tables + their enums | Changing scheduler/dedup or watchlist schema |
 | `src/models/candidate.py` | `CandidateProfile`, `ProjectItem` — **Pydantic only, not DB tables** | Adding profile fields |
 | `src/services/pipeline.py` | Orchestrator: the 3 ingestion pipelines + gap-filling | Changing ingestion behavior |
-| `src/services/scraper.py` | HTTPX fetch, trafilatura extraction, 3 ATS API resolvers, DDGS fallback | New ATS (e.g. Workday), fetch bugs |
+| `src/services/scraper.py` | HTTPX fetch, trafilatura extraction, 3 ATS API resolvers, optional Playwright renderer (JS-only ATS e.g. Workday), DDGS fallback | New ATS, fetch bugs |
 | `src/services/extractor.py` | Gemini text/vision extraction into `ExtractedJobData`, model fallback chain | Changing extraction schema/prompt |
 | `src/services/verifier.py` | Scam regexes, trusted ATS whitelist, DDGS portal discovery | Trust/scam logic |
 | `src/services/profile.py` | Profile load/save/update, project parsing, `evaluate_job_match` scoring | Match logic, profile fields |
@@ -122,7 +122,7 @@ match/save steps as B.
 | `data/projects/<slug>/` | Project KB: `README.md` + `project.json` per project | Auto-managed by github_service |
 | `data/uploads/` | Downloaded Telegram media (auto-created) | Debugging image ingestion |
 | `resumes/` | Generated `Resume_*_Job{id}.pdf` + `.md` | Output only |
-| `tests/` | 17 files, 99 tests, in-memory SQLite via `conftest.py` | Every feature addition |
+| `tests/` | 17 files, 111 tests, in-memory SQLite via `conftest.py` | Every feature addition |
 | `internships.db` | SQLite database (git-ignored state) | Inspect with sqlite3 |
 
 **Dead code to know about (don't get confused while debugging):**
@@ -195,10 +195,21 @@ Resolution order (first win returns):
    from domain, hits `api.ashbyhq.com/posting-api/job-board/{slug}`
 2. **`_resolve_greenhouse_job`** — `gh_jid` + board token → `boards-api.greenhouse.io/v1/boards/...`
 3. **`_resolve_lever_job`** — `lever_jid` + slug → `api.lever.co/v0/postings/...`
-4. **httpx GET** with Chrome-like headers → `trafilatura.extract()` (falls back to
-   `trafilatura.baseline` if <50 chars)
-5. **`_search_grounding_fallback`** — on HTTP ≥400, empty SPA text, timeout, or network error:
-   builds a DDGS query from URL segments, returns combined snippets as synthetic "text"
+4. **JS-only portals** — `myworkdayjobs.com` (Workday) hosts are known to answer static HTTP
+   with an empty shell, so they go straight to `_playwright_fetch` when available
+5. **httpx GET** with Chrome-like headers → `_extract_clean_text()` (`trafilatura.extract()`
+   with `trafilatura.baseline` fallback, discarded under the 50-char threshold)
+6. **`_playwright_fetch` retry** — on thin SPA shells (HTTP <400, tiny text) or bot-challenge
+   statuses (401/403/429/503): headless Chromium renders the page (images/media/fonts blocked),
+   `wait_for_load_state("networkidle")` up to 4s, same 50-char quality gate as HTTP
+7. **`_search_grounding_fallback`** — on anything still failing (incl. HTTP ≥400, timeout,
+   network error): builds a DDGS query from URL segments, returns combined snippets as
+   synthetic "text"
+
+Browser availability: `playwright_available()` = package importable **and**
+`settings.PLAYWRIGHT_ENABLED` (default True, toggle via `.env`). Browsers launch per call from
+worker threads (safe with Python Telegram Bot's `asyncio.to_thread` wrappers); nothing is
+cached across URLs at the moment.
 
 ### 5.2 `extractor.py` — LLM with a contract
 - Schema: `ExtractedJobData` (company, role, locations, deadline `YYYY-MM-DD` string, URL,
@@ -541,7 +552,10 @@ python -c "from src.database import get_session, purge_duplicate_jobs; s=next(ge
 
 ## 8. Testing
 
-- `pytest -v` → 99 tests, ~20s. No network, no API keys, no real DB.
+- `pytest -v` → 111 tests, ~20s. No network, no API keys, no real DB.
+- `ruff check src tests` → pinned critical-correctness rule set (`ruff.toml`: E4/E7/E9/F/I; the
+  SQLAlchemy `!= None` IS-NOT-NULL idiom is whitelisted via E711/E712 ignores; `__init__.py`
+  re-exports are exempt). CI runs it on every push/PR before pytest.
 - `tests/conftest.py`: per-test in-memory SQLite engine (`StaticPool`), fresh schema, dropped after.
 - Coverage by file: bot handlers (**incl. scheduler job registration** — build tests set
   `APP_ENV=testing` so no DB init happens), config, database (**dedup/merge/status/
@@ -643,5 +657,6 @@ for quota errors."
 
 | Date | Version | Changes |
 |---|---|---|
+| 2026-10-24 | v1.2 | **Hardening + headless-Chromium backend + CI (111 tests):** ① Optional Playwright renderer in `scraper.py` — Workday (`myworkdayjobs.com`) and any thin-SPA/403/429 URL render in local headless Chromium (images/media/fonts blocked, 50-char quality gate) before DuckDuckGo search-grounding; `PLAYWRIGHT_ENABLED` toggle, dependency stays optional. ② Security — PII profile/resumes/PDFs are git-ignored and untracked; sanitized `candidate_profile.example.json` shipped; bot is deny-by-default when `TELEGRAM_ALLOWED_USER_ID` is unset (LOCKED banner, warning on every rejected message); upload filenames sanitized; HTTPS-only fetch contract for the scraper. ③ Correctness — digest urgent-actions exclude applied/interviewing/offered jobs; digest + reminder idempotency is check-before-send/log-after-success; all deadline logic uses a new `today_local()` helper (`TZ_OFFSET_HOURS`) instead of host-local `date.today()`; corrupt profile JSON raises loudly; ATS audit reports 0% (not 100%) when no keywords extract; scam verdicts no longer propagate scam URLs as `official_portal_url`. ④ Verifier rewrite — hostname/subdomain-exact trusted-ATS matching and token-boundary company↔domain matching (blocked `evilgreenhouse.io`/`noamazon.com` spoofing), search-grounding promotions validated the same way. ⑤ Performance/robustness — all blocking Gemini/HTTP/PDF handler calls wrapped in `asyncio.to_thread`; `find_existing_job` projects only `(id, company_name, role_title)`; ATS resolver IndexError guards; Gemini transient-error token classifier. ⑥ CI — GitHub Actions workflow (`.github/workflows/ci.yml`) runs `ruff check src tests` (pinned critical ruleset in new `ruff.toml`, ~65 pre-existing lint debts fixed) + the full pytest suite on every push/PR; Python 3.11 on ubuntu-latest, no secrets required. |
 | 2026-10-21 | v1.1 | **Tier 1 shipped (99 tests):** ① Real background scheduler — PTB JobQueue arms 8AM digest (`DIGEST_HOUR_LOCAL`), deadline reminders every 4h (≤2-day window) and discovery sweeps every 2h; idempotent via new `scheduler_log` table; reminders get urgency-grouped HTML. ② Skill alias engine `services/skills.py` (~40 alias groups + anti-containment pairs) wired into match scoring and ATS audit — DRF↔Django REST, K8s↔Kubernetes, Go↔Golang now match. ③ Proactive discovery `services/discovery.py` — `/watch` (CLI + Telegram) manages a `watch_targets` watchlist of Ashby/Greenhouse/Lever boards or any careers URL; `run_discovery` sweeps boards, filters intern/trainee titles, batch-extracts details in ONE LLM call per target, verifies, scores, ingests with `source_type=discovery`, and pushes only alert-worthy postings (≥0.65, not scam, not ineligible) — everything else saved silently. Manual `/discover` command too. Batch extractors added (`extract_multiple_jobs_from_text`, `extract_jobs_list_from_text`). Flaky scraper tests stubbed off the live DDGS fallback. |
 | 2026-10-21 | v1.0 | Baseline documented ("Working MVP", commit `4ab5b9b`). Sanitized `.env.example` (real credentials removed — **rotate keys**). |

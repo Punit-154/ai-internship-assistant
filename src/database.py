@@ -6,8 +6,10 @@ Provides thread-safe SQLite connection management, deduplication, and repository
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Generator, List, Optional, Tuple, Union
+
 from sqlalchemy import func
 from sqlmodel import Session, SQLModel, create_engine, select
+
 from src.config import settings
 from src.models.job import ApplicationStatus, IngestionSource, JobPosting, RawIngestion
 from src.models.system import SchedulerEventType, SchedulerLog, WatchTarget, WatchTargetType
@@ -15,6 +17,16 @@ from src.models.system import SchedulerEventType, SchedulerLog, WatchTarget, Wat
 
 def get_utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def today_local(tz_offset_hours: Optional[float] = None) -> date:
+    """Current calendar date honoring the configured local timezone offset (defaults to TZ_OFFSET_HOURS).
+
+    Using this instead of date.today() keeps deadline day-boundaries correct when the
+    process runs on a VPS whose system timezone is not the candidate's local timezone.
+    """
+    offset = settings.TZ_OFFSET_HOURS if tz_offset_hours is None else tz_offset_hours
+    return datetime.now(timezone(timedelta(hours=offset))).date()
 
 
 def get_engine(db_url: Optional[str] = None):
@@ -65,11 +77,14 @@ def find_existing_job(
     if exact_match:
         return exact_match
 
-    # 2. Normalized alphanumeric check
-    all_jobs = session.exec(select(JobPosting)).all()
-    for j in all_jobs:
-        if normalize_text_key(j.company_name) == norm_comp and normalize_text_key(j.role_title) == norm_role:
-            return j
+    # 2. Normalized alphanumeric check — project only the needed columns instead of
+    #    materializing every full JobPosting row (jobs carry heavy JSON/list columns).
+    pairs = session.exec(
+        select(JobPosting.id, JobPosting.company_name, JobPosting.role_title)
+    ).all()
+    for job_id, comp_name, role_name in pairs:
+        if normalize_text_key(comp_name) == norm_comp and normalize_text_key(role_name) == norm_role:
+            return session.get(JobPosting, job_id)
 
     return None
 
@@ -201,7 +216,7 @@ def get_upcoming_deadlines(
     ref_date: Optional[date] = None,
 ) -> List[JobPosting]:
     """Return active opportunities closing within the next `days_ahead` days."""
-    today = ref_date or date.today()
+    today = ref_date or today_local()
     cutoff = today + timedelta(days=days_ahead)
 
     statement = (
@@ -222,7 +237,7 @@ def get_expired_deadlines(
     ref_date: Optional[date] = None,
 ) -> List[JobPosting]:
     """Return unapplied opportunities whose deadline has passed."""
-    today = ref_date or date.today()
+    today = ref_date or today_local()
 
     statement = (
         select(JobPosting)
@@ -320,7 +335,7 @@ def get_jobs_needing_deadline_reminder(
 
     Jobs already reminded today are filtered out via the scheduler log.
     """
-    today = ref_date or date.today()
+    today = ref_date or today_local()
     cutoff = today + timedelta(days=window_days)
 
     statement = (

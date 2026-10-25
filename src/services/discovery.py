@@ -18,7 +18,8 @@ verify -> match -> dedup-merge persistence as manual ingestion.
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date as Date, datetime
+from datetime import date as Date
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 import httpx
@@ -32,6 +33,7 @@ from src.database import (
     log_scheduler_event,
     save_or_update_job_posting,
     save_raw_ingestion,
+    today_local,
     touch_watch_target,
 )
 from src.models.job import (
@@ -49,7 +51,11 @@ from src.services.extractor import (
 )
 from src.services.profile import evaluate_job_match
 from src.services.scraper import scrape_url
-from src.services.verifier import detect_scam_signals, verify_opportunity
+from src.services.verifier import (
+    detect_scam_signals,
+    summarize_verification_source,
+    verify_opportunity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +279,7 @@ def _build_job_from_listing(
         )
         verification_status = verif.verification_status
         is_official = verif.is_official
-        verification_source = verif.notes
+        verification_source = summarize_verification_source(verif, fallback_url=url)
         if verif.official_portal_url:
             url = verif.official_portal_url
     else:
@@ -454,7 +460,7 @@ def run_discovery(
     Returns only NEW outcomes across all targets; dedup merges are excluded.
     """
     new_outcomes: List[DiscoveredJobOutcome] = []
-    today = ref_date or datetime.utcnow().date()
+    today = ref_date or today_local()
 
     targets = list_watch_targets(session, active_only=True)
     if not targets:

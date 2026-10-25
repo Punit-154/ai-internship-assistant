@@ -6,12 +6,14 @@ unstructured job postings from text and multimodal screenshots/images into valid
 
 import json
 import logging
-import mimetypes
-from datetime import date, datetime
+import re
+from datetime import datetime, timezone
 from typing import List, Optional
-from pydantic import BaseModel, Field
+
 from google import genai
 from google.genai import types
+from pydantic import BaseModel, Field
+
 from src.config import settings
 
 logger = logging.getLogger(__name__)
@@ -48,7 +50,9 @@ class ExtractedJobsList(BaseModel):
     jobs: List[ExtractedJobData] = Field(default_factory=list)
 
 
-EXTRACTION_SYSTEM_INSTRUCTION = """
+EXTRACTION_REFERENCE_YEAR = datetime.now(timezone.utc).year
+
+EXTRACTION_SYSTEM_INSTRUCTION = f"""
 You are a senior technical recruiter and extraction engine for student internship opportunities.
 Your task is to extract structured internship data from raw text or visual documents (screenshots, flyers, PDFs) with absolute fidelity and zero fabrication.
 
@@ -58,11 +62,11 @@ CRITICAL RULES:
    - If a field (like deadline or application URL) is not stated or visible, return null.
 2. GRADUATION YEAR & ELIGIBILITY:
    - Identify any graduation year constraints (e.g., '2027, 2028', 'Class of 2028').
-   - If stated by college year (e.g. '2nd year', '3rd year students', 'pre-final year'), map them based on a standard 4-year degree (Current reference year: 2026):
-     * 1st year = 2029
-     * 2nd year = 2028
-     * 3rd year / Pre-final = 2027
-     * 4th year / Final = 2026
+   - If stated by college year (e.g. '2nd year', '3rd year students', 'pre-final year'), map them based on a standard 4-year degree (Current reference year: {EXTRACTION_REFERENCE_YEAR}):
+     * 1st year = {EXTRACTION_REFERENCE_YEAR + 3}
+     * 2nd year = {EXTRACTION_REFERENCE_YEAR + 2}
+     * 3rd year / Pre-final = {EXTRACTION_REFERENCE_YEAR + 1}
+     * 4th year / Final = {EXTRACTION_REFERENCE_YEAR}
    - If no year or batch is restricted, leave allowed_grad_years as an empty list [].
 3. ROLE TYPE:
    - Set is_internship = False if the posting is explicitly for senior, staff, or experienced professionals (e.g., '5+ years experience required').
@@ -97,13 +101,13 @@ def generate_content_with_fallback(
             )
         except Exception as exc:
             err_str = str(exc)
-            is_transient = any(
-                term in err_str.lower()
+            err_l = err_str.lower()
+            # HTTP-style status codes only match as whole tokens, so unrelated
+            # numbers containing "500" (amounts, IDs, "HTTP 1500") don't
+            # misclassify legitimate failures as transient.
+            is_transient = bool(re.search(r"\b(429|500|502|503|504|404)\b", err_str)) or any(
+                term in err_l
                 for term in [
-                    "429",
-                    "503",
-                    "500",
-                    "404",
                     "resource_exhausted",
                     "unavailable",
                     "high demand",

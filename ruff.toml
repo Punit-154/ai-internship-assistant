@@ -1,0 +1,22 @@
+# CI lint gate: critical-priority pyflakes/pycodestyle rules only.
+# Deliberately narrow — correctness, not style churn.
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+    "E4",   # pycodestyle: indentation, whitespace correctness
+    "E7",   # pycodestyle: statement-level errors (E711/E712/E722...)
+    "E9",   # pycodestyle: runtime-level errors (syntax, NameError)
+    "F",    # Pyflakes: unused imports/vars, f-string issues, shadowing
+    "I",    # isort: import block ordering (safe for this codebase's flat import graph)
+]
+ignore = [
+    "E711",  # SQLAlchemy: `Model.field != None` is the correct IS NOT NULL idiom
+    "E712",  # SQLAlchemy: same for boolean column comparisons
+    "E741",  # ambiguous single-letter names — style-only, backlog
+]
+
+[lint.per-file-ignores]
+# Package re-export modules: imports in __all__ are API surface, not usage.
+"__init__.py" = ["F401"]

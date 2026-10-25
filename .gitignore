@@ -19,6 +19,15 @@ __pycache__/
 data/uploads/*
 !data/uploads/.gitkeep
 
+# Personal data with PII (never publish; keep local only)
+data/candidate_profile.json
+data/master_resume_analysis.md
+
+# Generated resumes & media artifacts
+resumes/
+test_pure.pdf
+data/*.png
+
 # IDE & OS
 .vscode/
 .idea/

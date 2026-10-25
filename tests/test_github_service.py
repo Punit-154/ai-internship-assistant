@@ -1,8 +1,8 @@
 ﻿"""Tests for GitHub Project Ingestion and Knowledge Base Service."""
 
-import json
 from pathlib import Path
 from unittest.mock import MagicMock
+
 from src.models.candidate import ProjectItem
 from src.services.github_service import (
     extract_github_repo_coords,

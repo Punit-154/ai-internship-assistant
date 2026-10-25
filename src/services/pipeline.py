@@ -8,11 +8,12 @@ import logging
 import mimetypes
 import shutil
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+
 from sqlmodel import Session
+
 from src.config import settings
 from src.database import save_job_posting, save_raw_ingestion
 from src.models.job import (
@@ -20,7 +21,6 @@ from src.models.job import (
     EligibilityStatus,
     IngestionSource,
     JobPosting,
-    RawIngestion,
     VerificationStatus,
 )
 from src.services.extractor import (
@@ -31,9 +31,8 @@ from src.services.extractor import (
 from src.services.profile import evaluate_job_match
 from src.services.scraper import scrape_url
 from src.services.verifier import (
-    TRUSTED_ATS_DOMAINS,
-    VerificationResult,
     search_official_career_portal,
+    summarize_verification_source,
     verify_opportunity,
 )
 
@@ -169,7 +168,7 @@ def process_url_pipeline(
         required_skills=extracted.required_skills,
         preferred_skills=extracted.preferred_skills,
         verification_status=verif.verification_status,
-        verification_source=verif.notes,
+        verification_source=summarize_verification_source(verif, fallback_url=app_url),
         is_official_portal=verif.is_official,
         application_status=ApplicationStatus.NEW,
         notes=notes,
@@ -251,7 +250,7 @@ def process_text_pipeline(
         required_skills=extracted.required_skills,
         preferred_skills=extracted.preferred_skills,
         verification_status=verif.verification_status,
-        verification_source=verif.notes,
+        verification_source=summarize_verification_source(verif, fallback_url=app_url),
         is_official_portal=verif.is_official,
         application_status=ApplicationStatus.NEW,
         notes=notes,
@@ -360,7 +359,7 @@ def process_image_pipeline(
             )
 
     settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    dest_filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{file_path.suffix}"
+    dest_filename = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{file_path.suffix}"
     dest_path = settings.UPLOAD_DIR / dest_filename
     if file_path.parent != settings.UPLOAD_DIR:
         shutil.copyfile(file_path, dest_path)
@@ -430,7 +429,7 @@ def process_image_pipeline(
         required_skills=extracted.required_skills,
         preferred_skills=extracted.preferred_skills,
         verification_status=verif.verification_status,
-        verification_source=verif.notes,
+        verification_source=summarize_verification_source(verif, fallback_url=app_url),
         is_official_portal=verif.is_official,
         application_status=ApplicationStatus.NEW,
         notes=notes,

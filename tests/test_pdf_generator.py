@@ -1,7 +1,8 @@
 ﻿"""Tests for Pure-Python ATS PDF Resume Generator."""
 
 from pathlib import Path
-from src.models.candidate import CandidateProfile, ProjectItem
+
+from src.models.candidate import CandidateProfile
 from src.services.pdf_generator import (
     PDFResumeBuilder,
     generate_resume_pdf,

@@ -2,7 +2,7 @@
 
 Provides mobile ingestion and control:
 - Handles shared links (scraped via scraper & ATS resolvers)
-- Handles screenshots and camera uploads (multimodal Gemini 3.8 Flash)
+- Handles screenshots and camera uploads (multimodal Gemini Flash)
 - Handles forwarded text announcements
 - Handles PDF brochures
 - Provides candidate profile inspection and project additions
@@ -12,12 +12,14 @@ Provides mobile ingestion and control:
 """
 
 import asyncio
+import functools
 import html
 import logging
 import re
-from datetime import date, datetime, time as dt_time, timedelta, timezone
-from pathlib import Path
+from datetime import date, timedelta, timezone
+from datetime import time as dt_time
 from typing import List, Optional, Tuple
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import NetworkError, TimedOut
@@ -35,16 +37,16 @@ from src.config import settings
 from src.database import (
     add_watch_target,
     deactivate_watch_target,
-    get_expired_deadlines,
     get_job_by_id,
-    get_jobs_by_status,
     get_jobs_needing_deadline_reminder,
     get_session,
     get_upcoming_deadlines,
+    has_scheduler_event,
     init_db,
     list_jobs,
     list_watch_targets,
     log_scheduler_event,
+    today_local,
     update_job_application_status,
 )
 from src.models.job import (
@@ -54,16 +56,6 @@ from src.models.job import (
     VerificationStatus,
 )
 from src.models.system import SchedulerEventType, WatchTargetType
-from src.services.pipeline import (
-    process_image_pipeline,
-    process_text_pipeline,
-    process_url_pipeline,
-)
-from src.services.profile import (
-    add_project_to_profile,
-    get_candidate_profile,
-    parse_project_from_text,
-)
 from src.services.digest import (
     build_daily_digest,
     format_deadline_reminder_html,
@@ -75,8 +67,22 @@ from src.services.discovery import (
     is_internship_title,
     run_discovery,
 )
+from src.services.github_service import (
+    extract_github_repo_coords,
+    ingest_github_project,
+    save_project_to_knowledge_base,
+)
+from src.services.pipeline import (
+    process_image_pipeline,
+    process_text_pipeline,
+    process_url_pipeline,
+)
+from src.services.profile import (
+    add_project_to_profile,
+    get_candidate_profile,
+    parse_project_from_text,
+)
 from src.services.resume import tailor_resume_for_job
-from src.services.github_service import extract_github_repo_coords, ingest_github_project, save_project_to_knowledge_base
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +91,51 @@ URL_REGEX = re.compile(
 )
 
 
-def is_authorized(user_id: int) -> bool:
-    """Check whether incoming user is whitelisted."""
-    if not settings.TELEGRAM_ALLOWED_USER_ID:
-        return True
+def is_authorized(user_id: Optional[int]) -> bool:
+    """Check whether incoming user is whitelisted.
+
+    Deny-by-default: if TELEGRAM_ALLOWED_USER_ID is unset (or the user is unknown),
+    nobody may use the bot. This avoids strangers driving Gemini API spend and
+    ingestion uploads on an unconfigured instance.
+    """
+    if user_id is None or not settings.TELEGRAM_ALLOWED_USER_ID:
+        return False
     return user_id == settings.TELEGRAM_ALLOWED_USER_ID
+
+
+async def _reject_unauthorized(update: Update) -> None:
+    """Notify an unauthorized user (if in private chat) and log the attempt."""
+    user = update.effective_user
+    logger.warning(f"Blocked unauthorized Telegram access: {user.id if user else 'unknown'}")
+    if update.callback_query:
+        try:
+            await update.callback_query.answer("⛔ Unauthorized. This is a private assistant instance.", show_alert=True)
+        except Exception as exc:
+            logger.debug(f"Could not answer unauthorized callback: {exc}")
+    elif update.effective_message:
+        try:
+            await update.effective_message.reply_text("⛔ Unauthorized. This is a private assistant instance.")
+        except Exception as exc:
+            logger.debug(f"Could not notify unauthorized user: {exc}")
+
+
+def requires_authorization(handler):
+    """Guard a Telegram handler so it only executes for the whitelisted user."""
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not is_authorized(user.id if user else None):
+            await _reject_unauthorized(update)
+            return
+        return await handler(update, context)
+    return wrapper
+
+
+def _sanitize_filename(raw: str) -> str:
+    """Strip path traversal and unsafe characters from an uploaded filename (Telegram-side input)."""
+    name = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"[\x00-\x1f\"<>|:*?]+", "_", name).strip().lstrip(".")
+    return name[:100] or "document.pdf"
 
 
 def get_job_inline_keyboard(job_id: int, application_url: Optional[str] = None) -> InlineKeyboardMarkup:
@@ -176,13 +222,10 @@ def format_job_html_card(job: JobPosting) -> str:
 # Telegram Command Handlers
 # ==============================================================================
 
+@requires_authorization
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start and /help commands."""
     user = update.effective_user
-    if not is_authorized(user.id):
-        await update.message.reply_text("⛔ Unauthorized. This is a private assistant instance.")
-        return
-
     welcome_text = (
         f"👋 <b>Welcome back, {html.escape(user.first_name)}!</b>\n\n"
         "I am your <b>Personal AI Internship Intelligence Assistant</b>.\n\n"
@@ -209,11 +252,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
 
 
+@requires_authorization
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /profile command."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     p = get_candidate_profile()
     msg = (
         f"👤 <b>CANDIDATE PROFILE: {html.escape(p.full_name)}</b>\n"
@@ -239,11 +280,9 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
+@requires_authorization
 async def cmd_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /addproject <text_or_github_url> command."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     text = " ".join(context.args) if context.args else ""
     if not text:
         await update.message.reply_text(
@@ -263,7 +302,7 @@ async def cmd_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=ParseMode.HTML,
         )
         try:
-            project, new_skills, folder = ingest_github_project(text)
+            project, new_skills, folder = await asyncio.to_thread(ingest_github_project, text)
         except Exception as exc:
             logger.error(f"Error ingesting GitHub project: {exc}")
             await status_msg.edit_text(f"? Failed to ingest GitHub project: {html.escape(str(exc))}")
@@ -271,9 +310,9 @@ async def cmd_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         status_msg = await update.message.reply_text("?? Analyzing and structuring project with Gemini...")
         try:
-            project = parse_project_from_text(text)
-            folder = save_project_to_knowledge_base(project)
-            updated_profile, new_skills = add_project_to_profile(project)
+            project = await asyncio.to_thread(parse_project_from_text, text)
+            folder = await asyncio.to_thread(save_project_to_knowledge_base, project)
+            _, new_skills = await asyncio.to_thread(add_project_to_profile, project)
         except Exception as exc:
             logger.error(f"Error adding project via Telegram: {exc}")
             await status_msg.edit_text(f"? Failed to parse project: {html.escape(str(exc))}")
@@ -295,11 +334,9 @@ async def cmd_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await status_msg.edit_text(response, parse_mode=ParseMode.HTML)
 
 
+@requires_authorization
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /list command to show saved opportunities."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     with get_session() as session:
         jobs = list_jobs(session, limit=10)
         if not jobs:
@@ -320,11 +357,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+@requires_authorization
 async def cmd_tailor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /tailor <job_id> to generate a tailored ATS resume and cold outreach pitch."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     args = context.args
     if not args or not args[0].isdigit():
         await update.message.reply_text(
@@ -351,7 +386,7 @@ async def cmd_tailor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         profile = get_candidate_profile()
 
         try:
-            tailored_res = tailor_resume_for_job(profile, job)
+            tailored_res = await asyncio.to_thread(tailor_resume_for_job, profile, job)
 
             # Build summary message
             summary_html = (
@@ -367,8 +402,7 @@ async def cmd_tailor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
             await status_msg.edit_text(summary_html, parse_mode=ParseMode.HTML)
 
-            # Send the .tex file directly as a Telegram Document
-            # If PDF was compiled, send that as well
+            # Deliver the ready-to-send ATS PDF as a Telegram Document
             if tailored_res.pdf_file_path and tailored_res.pdf_file_path.exists():
                 with open(tailored_res.pdf_file_path, "rb") as pdf_f:
                     await context.bot.send_document(
@@ -386,14 +420,12 @@ async def cmd_tailor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
 
 
+@requires_authorization
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /status <job_id> <new_status> [notes] to update application status."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     args = context.args
     if not args or len(args) < 2 or not args[0].isdigit():
-        valid_opts = "new, applied, interviewing, offer, rejected, archived"
+        valid_opts = "new, reviewed, applied, interviewing, offer, rejected, archived"
         await update.message.reply_text(
             "📋 <b>Usage:</b> <code>/status &lt;job_id&gt; &lt;new_status&gt; [notes]</code>\n\n"
             f"<b>Allowed Statuses:</b> <code>{valid_opts}</code>\n\n"
@@ -434,16 +466,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text(f"❌ {html.escape(str(exc))}")
 
 
+@requires_authorization
 async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /deadlines command to list upcoming deadlines."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     days_ahead = 14
     if context.args and context.args[0].isdigit():
         days_ahead = int(context.args[0])
 
-    today = date.today()
+    today = today_local()
     with get_session() as session:
         upcoming = get_upcoming_deadlines(session, days_ahead=days_ahead)
         if not upcoming:
@@ -469,19 +499,17 @@ async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
             lines.append(f"• <b>#{j.id} {comp}</b> — {role}\n  [{badge}] | Status: <code>{j.application_status.value.upper()}</code>")
 
-        lines.append(f"\n<i>Tailor an application:</i> <code>/tailor &lt;id&gt;</code>")
+        lines.append("\n<i>Tailor an application:</i> <code>/tailor &lt;id&gt;</code>")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+@requires_authorization
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /digest command to generate the daily internship briefing on demand."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     status_msg = await update.message.reply_text("🌅 <i>Synthesizing daily intelligence briefing...</i>", parse_mode=ParseMode.HTML)
     with get_session() as session:
         try:
-            report = build_daily_digest(session)
+            report = await asyncio.to_thread(build_daily_digest, session)
             digest_html = format_digest_html(report)
             await status_msg.edit_text(digest_html, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except Exception as exc:
@@ -498,27 +526,42 @@ def get_target_chat_id() -> Optional[int]:
     return settings.TELEGRAM_ALLOWED_USER_ID
 
 
-def _sync_build_digest_html() -> str:
-    """Blocking digest build for asyncio.to_thread (reads/writes DB)."""
+def _sync_build_digest_html() -> Optional[str]:
+    """Blocking digest build for asyncio.to_thread (reads DB).
+
+    Returns None when today's digest was already delivered (idempotency check);
+    the ledger row is only written after the send succeeds, so a failed delivery
+    is retried on the next run instead of being silently lost.
+    """
     with get_session() as session:
+        if has_scheduler_event(session, SchedulerEventType.DAILY_DIGEST, "digest", today_local()):
+            return None
         report = build_daily_digest(session)
-        digest_html = format_digest_html(report)
-        log_scheduler_event(session, SchedulerEventType.DAILY_DIGEST, "digest", date.today())
-        return digest_html
+        return format_digest_html(report)
 
 
-def _sync_collect_deadline_reminders() -> List[Tuple[JobPosting, int]]:
+def _sync_log_digest_delivered() -> None:
+    """Record today's daily digest as delivered (called only after a successful send)."""
     with get_session() as session:
+        log_scheduler_event(session, SchedulerEventType.DAILY_DIGEST, "digest", today_local())
+
+
+def _sync_collect_deadline_reminders() -> Tuple[List[Tuple[JobPosting, int]], date]:
+    """Collect unapplied jobs closing soon; return pairs plus the 'today' date used for dedupe."""
+    with get_session() as session:
+        today = today_local()
         pairs = get_jobs_needing_deadline_reminder(
-            session, window_days=settings.DEADLINE_REMINDER_WINDOW_DAYS
+            session, window_days=settings.DEADLINE_REMINDER_WINDOW_DAYS, ref_date=today
         )
-        return [(job, days) for job, days in pairs]
+        # Materialize into plain tuples so ORM objects detached from this session stay usable.
+        return [(job, days) for job, days in pairs], today
 
 
-def _sync_mark_reminders_sent(pairs: List[Tuple[JobPosting, int]]) -> None:
+def _sync_mark_reminders_sent(pairs: List[Tuple[JobPosting, int]], sent_date: date) -> None:
+    """Mark reminders as delivered using the same 'today' reference as the collect step."""
     with get_session() as session:
         for job, _days in pairs:
-            log_scheduler_event(session, SchedulerEventType.DEADLINE_REMINDER, str(job.id), date.today())
+            log_scheduler_event(session, SchedulerEventType.DEADLINE_REMINDER, str(job.id), sent_date)
 
 
 def _sync_run_discovery() -> Tuple[list, int]:
@@ -539,12 +582,16 @@ async def scheduled_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     try:
         digest_html = await asyncio.to_thread(_sync_build_digest_html)
+        if digest_html is None:
+            logger.info("[Scheduler] Daily digest already delivered today; skipping.")
+            return
         await context.bot.send_message(
             chat_id=chat_id,
             text=digest_html,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+        await asyncio.to_thread(_sync_log_digest_delivered)
     except Exception as exc:
         logger.error(f"[Scheduler] Daily digest failed: {exc}")
 
@@ -557,7 +604,7 @@ async def scheduled_deadline_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat_id:
         return
     try:
-        pairs = await asyncio.to_thread(_sync_collect_deadline_reminders)
+        pairs, reminder_today = await asyncio.to_thread(_sync_collect_deadline_reminders)
         if not pairs:
             return
         reminder_text = format_deadline_reminder_html(pairs)
@@ -567,7 +614,7 @@ async def scheduled_deadline_check(context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-        await asyncio.to_thread(_sync_mark_reminders_sent, pairs)
+        await asyncio.to_thread(_sync_mark_reminders_sent, pairs, reminder_today)
     except Exception as exc:
         logger.error(f"[Scheduler] Deadline reminder sweep failed: {exc}")
 
@@ -664,11 +711,9 @@ def _board_browser_url(target) -> str:
     }.get(target.target_type, k)
 
 
+@requires_authorization
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /watch add|list|remove — manage the ATS board discovery watchlist."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     args = context.args or []
     if not args:
         await update.message.reply_text(
@@ -773,11 +818,9 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("❓ Unknown action. Use <code>/watch add|list|remove</code>.", parse_mode=ParseMode.HTML)
 
 
+@requires_authorization
 async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /discover — run one discovery sweep across the watchlist right now."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     status_msg = await update.message.reply_text(
         "🛰️ <i>Checking your watchlist boards for new internship postings...</i>",
         parse_mode=ParseMode.HTML,
@@ -818,12 +861,10 @@ async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(summary, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+@requires_authorization
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle interactive button clicks from job cards."""
     query = update.callback_query
-    if not is_authorized(query.from_user.id):
-        await query.answer("Unauthorized.", show_alert=True)
-        return
 
     data = query.data
     if not data:
@@ -865,7 +906,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
                 profile = get_candidate_profile()
                 try:
-                    tailored_res = tailor_resume_for_job(profile, job)
+                    tailored_res = await asyncio.to_thread(tailor_resume_for_job, profile, job)
                     matched_kws = ', '.join(tailored_res.ats_audit.matched_keywords) or 'None'
                     missing_kws = ', '.join(tailored_res.ats_audit.missing_keywords) or 'None'
 
@@ -900,11 +941,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 # Message Ingestion Handlers (URLs, Plain Text, Screenshots, PDFs)
 # ==============================================================================
 
+@requires_authorization
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Process incoming text messages, auto-detecting URLs vs raw job forwards."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     text = update.message.text.strip()
     if not text:
         return
@@ -921,7 +960,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         with get_session() as session:
             try:
-                job = process_url_pipeline(
+                job = await asyncio.to_thread(
+                    process_url_pipeline,
                     session=session,
                     url=target_url,
                     source_type=IngestionSource.TELEGRAM_URL,
@@ -938,7 +978,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         with get_session() as session:
             try:
-                job = process_text_pipeline(
+                job = await asyncio.to_thread(
+                    process_text_pipeline,
                     session=session,
                     raw_text=text,
                     source_type=IngestionSource.TELEGRAM_TEXT,
@@ -950,11 +991,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await status_msg.edit_text(f"❌ <b>Extraction Failed:</b>\n<i>{html.escape(str(exc))}</i>", parse_mode=ParseMode.HTML)
 
 
+@requires_authorization
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Download screenshot/photo from Telegram and run multimodal extraction."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     photos = update.message.photo
     if not photos:
         return
@@ -972,7 +1011,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await status_msg.edit_text("🔍 <b>Analyzing visual flyer with Gemini Flash...</b>", parse_mode=ParseMode.HTML)
 
         with get_session() as session:
-            job = process_image_pipeline(
+            job = await asyncio.to_thread(
+                process_image_pipeline,
                 session=session,
                 file_path=local_image_path,
                 source_type=IngestionSource.TELEGRAM_IMAGE,
@@ -985,29 +1025,29 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await status_msg.edit_text(f"❌ <b>Image Extraction Failed:</b>\n<i>{html.escape(str(exc))}</i>", parse_mode=ParseMode.HTML)
 
 
+@requires_authorization
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Download PDF or uncompressed document and run multimodal extraction."""
-    if not is_authorized(update.effective_user.id):
-        return
-
     doc = update.message.document
     if not doc:
         return
 
-    filename = doc.file_name or "document.pdf"
-    status_msg = await update.message.reply_text(f"📥 <b>Downloading {html.escape(filename)}...</b>", parse_mode=ParseMode.HTML)
+    # Sanitize the user-controlled filename before using it on disk.
+    safe_filename = _sanitize_filename(doc.file_name or "document.pdf")
+    status_msg = await update.message.reply_text(f"📥 <b>Downloading {html.escape(safe_filename)}...</b>", parse_mode=ParseMode.HTML)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
 
     try:
         tg_file = await doc.get_file()
         settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        local_doc_path = settings.UPLOAD_DIR / f"tg_{doc.file_unique_id}_{filename}"
+        local_doc_path = settings.UPLOAD_DIR / f"tg_{doc.file_unique_id}_{safe_filename}"
         await tg_file.download_to_drive(custom_path=local_doc_path)
 
         await status_msg.edit_text("🔍 <b>Extracting job specifications with Gemini...</b>", parse_mode=ParseMode.HTML)
 
         with get_session() as session:
-            job = process_image_pipeline(
+            job = await asyncio.to_thread(
+                process_image_pipeline,
                 session=session,
                 file_path=local_doc_path,
                 source_type=IngestionSource.TELEGRAM_IMAGE,
@@ -1090,7 +1130,8 @@ def build_telegram_app() -> Application:
 def run_telegram_bot() -> None:
     """Start the Telegram bot using long polling with the background scheduler armed."""
     print("[*] Starting Telegram Bot with long polling...")
-    print(f"[*] Whitelisted Telegram User ID: {settings.TELEGRAM_ALLOWED_USER_ID or 'All (Warning: Open)'}")
+    whitelist_state = settings.TELEGRAM_ALLOWED_USER_ID or "LOCKED (no user whitelisted — set TELEGRAM_ALLOWED_USER_ID in .env)"
+    print(f"[*] Whitelisted Telegram User ID: {whitelist_state}")
     print("[*] Resilient HTTP timeouts: 30s connect / 30s read")
     print("[*] Resume Tailoring enabled (/tailor <id>)")
     print("[*] Background jobs: 8AM digest | deadline reminders | watchlist discovery")

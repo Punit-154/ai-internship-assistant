@@ -7,6 +7,7 @@ discovery engine. Kept separate from job models for clear domain boundaries.
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Optional
+
 from sqlmodel import Field, SQLModel
 
 

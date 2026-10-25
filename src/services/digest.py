@@ -9,19 +9,23 @@ Aggregates:
 
 import html
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date
 from typing import List, Optional, Tuple
+
 from sqlmodel import Session
 
 from src.database import (
     get_expired_deadlines,
     get_jobs_by_status,
     get_upcoming_deadlines,
-    list_jobs,
+    today_local,
 )
 from src.models.candidate import CandidateProfile
 from src.models.job import ApplicationStatus, EligibilityStatus, JobPosting
 from src.services.profile import evaluate_job_match, get_candidate_profile
+
+# Statuses tracked by digest urgency actions: jobs the candidate can still apply to.
+OPEN_STATUSES = (ApplicationStatus.NEW, ApplicationStatus.REVIEWED)
 
 
 @dataclass
@@ -43,25 +47,28 @@ def build_daily_digest(
     ref_date: Optional[date] = None,
 ) -> DigestReport:
     """Build a comprehensive daily digest of opportunities, deadlines, and active tracks."""
-    today = ref_date or date.today()
+    today = ref_date or today_local()
     cand_profile = profile or get_candidate_profile()
 
-    # 1. Evaluate open opportunities for candidate match
-    unapplied_jobs = list_jobs(session, limit=100)
+    # 1. Evaluate open opportunities for candidate match (status filtered in SQL)
+    open_jobs = get_jobs_by_status(
+        session,
+        statuses=list(OPEN_STATUSES),
+        limit=100,
+    )
     high_matches: List[Tuple[JobPosting, float]] = []
 
-    for job in unapplied_jobs:
-        if job.application_status in [ApplicationStatus.NEW, ApplicationStatus.REVIEWED]:
-            match_eval = evaluate_job_match(
-                role_title=job.role_title,
-                locations=job.locations,
-                allowed_grad_years=job.allowed_grad_years,
-                required_skills=job.required_skills,
-                profile=cand_profile,
-            )
-            # Include if overall score passes threshold or explicitly eligible
-            if match_eval.overall_match_score >= match_threshold or job.eligibility_status == EligibilityStatus.ELIGIBLE:
-                high_matches.append((job, match_eval.overall_match_score))
+    for job in open_jobs:
+        match_eval = evaluate_job_match(
+            role_title=job.role_title,
+            locations=job.locations,
+            allowed_grad_years=job.allowed_grad_years,
+            required_skills=job.required_skills,
+            profile=cand_profile,
+        )
+        # Include if overall score passes threshold or explicitly eligible
+        if match_eval.overall_match_score >= match_threshold or job.eligibility_status == EligibilityStatus.ELIGIBLE:
+            high_matches.append((job, match_eval.overall_match_score))
 
     # Sort descending by match score
     high_matches.sort(key=lambda x: x[1], reverse=True)
@@ -87,8 +94,12 @@ def build_daily_digest(
     # 5. Synthesize Action Items
     actions: List[str] = []
 
-    # Priority 1: Closing soon (<= 3 days)
-    urgent_deadlines = [d for d in upcoming_deadlines if d[1] <= 3]
+    # Priority 1: Closing soon (<= 3 days), only for jobs still open to apply.
+    # APPLIED/INTERVIEWING/OFFER jobs closing soon are not "submit application" targets.
+    urgent_deadlines = [
+        d for d in upcoming_deadlines
+        if d[1] <= 3 and d[0].application_status in OPEN_STATUSES
+    ]
     for u_job, u_days in urgent_deadlines:
         day_str = "today!" if u_days == 0 else (f"in {u_days} day" if u_days == 1 else f"in {u_days} days")
         actions.append(f"URGENT: Submit application for #{u_job.id} {u_job.company_name} - closing {day_str}!")

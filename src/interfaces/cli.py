@@ -11,6 +11,7 @@ import sys
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
+
 from src.database import get_session, init_db, list_jobs, save_job_posting
 from src.models.candidate import ProjectItem
 from src.models.job import (
@@ -138,7 +139,7 @@ def cmd_update_profile(args):
         parsed_val = val
 
     try:
-        updated = update_candidate_profile({args.key: parsed_val})
+        update_candidate_profile({args.key: parsed_val})
         print(f"[+] Successfully updated '{args.key}' in candidate profile.")
         print_candidate_profile()
     except KeyError as exc:
@@ -151,7 +152,11 @@ def cmd_update_profile(args):
 
 def cmd_add_project(args):
     """Parse text or GitHub repo URL, save to dedicated knowledge base, and sync profile."""
-    from src.services.github_service import extract_github_repo_coords, ingest_github_project, save_project_to_knowledge_base
+    from src.services.github_service import (
+        extract_github_repo_coords,
+        ingest_github_project,
+        save_project_to_knowledge_base,
+    )
     print("[*] Processing project input...")
     try:
         if args.mock:
@@ -328,7 +333,7 @@ def cmd_tailor_resume(args):
             print("[+] Successfully generated ATS Resume!")
             print(f"    - Clean ATS PDF:    {res.pdf_file_path}")
             print(f"    - Markdown Copy:    {res.md_file_path}")
-            print(f"\n[ATS KEYWORD AUDIT REPORT]")
+            print("\n[ATS KEYWORD AUDIT REPORT]")
             print(f"    - ATS Match Score:  {res.ats_audit.match_percentage}%")
             print(f"    - Matched Keywords: {', '.join(res.ats_audit.matched_keywords) or 'None'}")
             print(f"    - Missing Gaps:     {', '.join(res.ats_audit.missing_keywords) or 'None'}")
@@ -350,10 +355,9 @@ def cmd_digest(args):
 
 def cmd_deadlines(args):
     """List opportunities with deadlines approaching in the next N days."""
-    from datetime import date
-    from src.database import get_upcoming_deadlines
+    from src.database import get_upcoming_deadlines, today_local
     days = args.days
-    today = date.today()
+    today = today_local()
     with get_session() as session:
         upcoming = get_upcoming_deadlines(session, days_ahead=days)
         if not upcoming:
@@ -434,7 +438,7 @@ def cmd_watch(args):
                 target = add_watch_target(session, company_label, args.type, key)
             except ValueError as exc:
                 print(f"[!] {exc}")
-                print(f"    Allowed types: ashby, greenhouse, lever, url")
+                print("    Allowed types: ashby, greenhouse, lever, url")
                 sys.exit(1)
             print(f"[+] Watch target #{target.id} registered: {target.company_name} ({target.target_type.value})")
             print(f"    Poll interval: every {settings.DISCOVERY_CHECK_INTERVAL_HOURS}h | Max ingested/run: {settings.DISCOVERY_MAX_PER_RUN}")

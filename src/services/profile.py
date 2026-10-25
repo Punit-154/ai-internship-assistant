@@ -10,8 +10,10 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
 from google import genai
 from google.genai import types
+
 from src.config import settings
 from src.models.candidate import CandidateProfile, ProjectItem
 from src.models.job import EligibilityStatus
@@ -51,7 +53,11 @@ def get_candidate_profile(file_path: Optional[Path] = None) -> CandidateProfile:
         return CandidateProfile.model_validate(data)
     except Exception as exc:
         logger.error(f"Error loading candidate profile from {target_path}: {exc}")
-        return CandidateProfile()
+        raise RuntimeError(
+            f"Corrupt or invalid candidate profile at {target_path}: {exc}\n"
+            "Fix or delete the file (see data/candidate_profile.example.json) and retry. "
+            "Falling back to defaults silently would risk overwriting your real profile with blank data."
+        ) from exc
 
 
 def save_candidate_profile(profile: CandidateProfile, file_path: Optional[Path] = None) -> None:

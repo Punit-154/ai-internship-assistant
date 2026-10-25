@@ -1,6 +1,5 @@
 """Tests for Configuration and Environment Parsing."""
 
-from pathlib import Path
 from src.config import Settings
 
 

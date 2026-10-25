@@ -7,7 +7,8 @@ and schema validation.
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import List, Optional
-from sqlmodel import Field, SQLModel, JSON
+
+from sqlmodel import JSON, Field, SQLModel
 
 
 def get_utc_now() -> datetime:

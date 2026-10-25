@@ -9,7 +9,12 @@ python-telegram-bot>=21.0
 python-telegram-bot[job-queue]>=21.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+ruff>=0.17.0
 ddgs>=9.0.0
 primp>=2.0.0
 
 reportlab>=5.0.0
+
+# Optional JS-heavy ATS support (Workday etc.):
+#   pip install playwright && playwright install chromium
+# playwright>=1.44

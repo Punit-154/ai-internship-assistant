@@ -7,6 +7,7 @@ so tests never touch disk or pollute real databases.
 import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
+
 from src.database import init_db
 
 

@@ -3,12 +3,13 @@
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
 import pytest
 from sqlmodel import Session
-from src.models.job import EligibilityStatus, IngestionSource, VerificationStatus
+
+from src.models.job import EligibilityStatus, IngestionSource
 from src.services.extractor import ExtractedJobData, extract_job_from_image
 from src.services.pipeline import process_image_pipeline
-
 
 # Minimal valid 1x1 PNG byte sequence
 TINY_PNG_BYTES = (

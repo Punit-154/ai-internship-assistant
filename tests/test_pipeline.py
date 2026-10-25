@@ -1,9 +1,10 @@
 """Tests for Pipeline Ingestion, Verification, and Auditing."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
+
 from sqlmodel import Session
+
 from src.models.job import (
-    ApplicationStatus,
     EligibilityStatus,
     IngestionSource,
     VerificationStatus,
@@ -39,8 +40,9 @@ def test_verify_portal_authenticity_company_domain():
     assert status == VerificationStatus.VERIFIED_OFFICIAL
 
 
-def test_verify_portal_authenticity_google_forms_warning():
-    """Verify that Google Forms are flagged as unverified third-party."""
+@patch("src.services.verifier.search_official_career_portal", return_value=None)
+def test_verify_portal_authenticity_google_forms_warning(mock_search):
+    """Verify that Google Forms are flagged as unverified third-party (search stubbed to stay offline)."""
     is_official, status, notes = verify_portal_authenticity(
         url="https://forms.gle/XYZ123456",
         company_name="StartupX",

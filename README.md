@@ -1,5 +1,7 @@
 # ?? AI-Powered Internship Intelligence & Automated Application Assistant
 
+![CI](https://github.com/Punit-154/ai-internship-assistant/actions/workflows/ci.yml/badge.svg)
+
 A production-grade, zero-fabrication personal internship intelligence system built for Computer Science engineering students. Seamlessly ingests opportunities from Telegram, job links, and screenshots, verifies job authenticity against ATS portals, dynamically tailors ATS-compliant pure vector PDF resumes using your real GitHub repositories, and tracks application lifecycles from application to offer.
 
 ---
@@ -14,7 +16,7 @@ flowchart TD
         INGEST["Ingestion Pipeline"]
         INGEST --> B1["Raw URL Scraper + Ashby/Greenhouse/Lever Resolvers"]
         INGEST --> B2["Plain-Text Parser"]
-        INGEST --> B3["Multimodal Vision (Gemini 3.8 Flash)"]
+        INGEST --> B3["Multimodal Vision (Gemini Flash)"]
     end
 
     subgraph Verification ["2. Verification & Guardrails"]
@@ -53,8 +55,8 @@ data/candidate_profile.json")]
 ## ?? Key Capabilities
 
 ### 1. Multimodal Opportunity Ingestion
-- **Direct Link Ingestion**: Scrapes and resolves direct ATS portals (Ashby, Greenhouse, Lever, Workday) and company career sites.
-- **Screenshot & Photo Extraction**: Upload camera captures, Instagram flyers, or PDF notices. Google Gemini 3.8 Flash extracts role, company, stipend, graduation year eligibility, and deadlines.
+- **Direct Link Ingestion**: Scrapes and resolves direct ATS portals (Ashby, Greenhouse, Lever, Workday) and company career sites. JavaScript-only portals that return empty HTML shells to static requests are rendered headlessly via an optional Playwright/Chromium backend.
+- **Screenshot & Photo Extraction**: Upload camera captures, Instagram flyers, or PDF notices. Google Gemini Flash (model configurable via `GEMINI_MODEL`) extracts role, company, stipend, graduation year eligibility, and deadlines.
 - **Search Grounding & Fallback**: If an image lacks an application link, the assistant uses live DuckDuckGo grounding to discover the authentic career portal URL.
 
 ### 2. Zero-Fabrication Candidate Profile Engine
@@ -90,16 +92,17 @@ data/candidate_profile.json")]
 ```
 ai-internship-assistant/
 ??? data/
-?   ??? candidate_profile.json     # Punit's verified profile, skills, and contact info
+?   ??? candidate_profile.json     # YOUR verified profile, skills, contact info (git-ignored; keep local)
+?   ??? candidate_profile.example.json  # Schema template with placeholder values (safe to commit)
 ?   ??? projects/                  # Dedicated project knowledge base
 ?       ??? reco-ai-.../           # Raw README.md & project.json
 ?       ??? rag-q-a-.../           # Raw README.md & project.json
 ?       ??? specvault-.../         # Raw README.md & project.json
 ?       ??? auto-scaling-.../      # Raw README.md & project.json
 ?       ??? blackbox-parser-.../   # Raw README.md & project.json
-??? resumes/                       # Generated ATS vector PDFs & companion markdown
-?   ??? Resume_InterviewKickstart_Job8.pdf
-?   ??? Resume_InterviewKickstart_Job8.md
+??? resumes/                       # Generated ATS vector PDFs & companion markdown (git-ignored)
+?   ??? Resume_<Company>_<Role>.pdf
+?   ??? Resume_<Company>_<Role>.md
 ??? src/
 ?   ??? config.py                  # Environment settings & Pydantic validation
 ?   ??? database.py                # SQLModel SQLite database engine
@@ -113,15 +116,17 @@ ai-internship-assistant/
 ?       ??? digest.py              # Morning intelligence digest generator
 ?       ??? discovery.py           # Proactive ATS board sweeper (/watch watchlist)
 ?       ??? skills.py              # Skill alias/acronym resolver
-?       ??? extractor.py           # Gemini 3.8 Flash structured extractor
+?       ??? extractor.py           # Gemini Flash structured extractor (model configurable)
 ?       ??? github_service.py      # GitHub README fetcher & KB persistence
 ?       ??? pdf_generator.py       # Pure-vector Type-1 ATS PDF generator
 ?       ??? pipeline.py            # End-to-end ingestion orchestrator
 ?       ??? profile.py             # Profile scoring & deduplication logic
 ?       ??? resume.py              # ATS keyword audit & resume tailorer
-?       ??? scraper.py             # HTTPX scraper & ATS resolver
+?       ??? scraper.py             # HTTPX scraper, ATS resolver & optional headless-Chromium fallback
 ?       ??? verifier.py            # Anti-scam heuristics & search grounding
-??? tests/                         # Comprehensive pytest test suite (99 tests)
+??? tests/                         # Comprehensive pytest test suite (111 tests)
+??? ruff.toml                      # Pinned critical-correctness lint config (CI gate)
+??? .github/workflows/ci.yml       # GitHub Actions: ruff + pytest on every push/PR
 ??? .env                           # Local environment credentials (ignored by git)
 ??? .env.example                   # Environment configuration template
 ??? internships.db                 # SQLite database storage
@@ -148,13 +153,19 @@ cd ai-internship-assistant
 python -m venv .venv
 
 # Windows:
-.\.venv\Scriptsctivate
+.\.venv\Scripts\activate
 # Linux/macOS:
 source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Optional: JavaScript-rendered ATS support (Workday, iCIMS Connect, etc.)
+# Installs the playwright package + a local headless Chromium (~120 MB, $0)
+pip install playwright
+playwright install chromium
 ```
+Without this step everything still works — the bot simply falls back to DuckDuckGo search-grounding for JS-only job pages instead of rendering them.
 
 ### 3. Environment Configuration
 Copy the template and configure your secrets:
@@ -224,7 +235,7 @@ The assistant includes a full-featured CLI for terminal workflows:
 
 ### Direct Mobile Ingestion
 - **Send any URL**: Simply paste a job link into Telegram. The bot resolves the ATS, extracts requirements, checks eligibility, and replies with an interactive card.
-- **Send any Screenshot / Flyer**: Send an image or photo. Gemini 3.8 Flash extracts the role details, discovers application URLs via DuckDuckGo if missing, and saves the job.
+- **Send any Screenshot / Flyer**: Send an image or photo. Gemini Flash extracts the role details, discovers application URLs via DuckDuckGo if missing, and saves the job.
 - **Forward announcements**: Forward text posts from university WhatsApp/Telegram channels directly into the bot.
 
 ---
@@ -280,32 +291,15 @@ Run the full automated test suite covering all modules:
 
 ```bash
 pytest -v
+ruff check src tests    # critical-correctness lint (pinned rule set in ruff.toml)
 ```
 
 **Results:**
 ```
 ============================= test session starts =============================
-collected 99 items
+collected 111 items
 
-tests/test_bot.py .........                                              [  9%]
-tests/test_config.py ..                                                  [ 11%]
-tests/test_database.py ..........                                        [ 21%]
-tests/test_digest.py ..                                                  [ 23%]
-tests/test_discovery.py ...........                                      [ 34%]
-tests/test_extractor.py ........                                         [ 42%]
-tests/test_github_service.py ....                                        [ 46%]
-tests/test_models.py ..                                                  [ 48%]
-tests/test_multimodal.py ......                                          [ 54%]
-tests/test_pdf_generator.py ...                                          [ 57%]
-tests/test_pipeline.py ......                                            [ 63%]
-tests/test_profile.py .........                                          [ 72%]
-tests/test_resume.py ...                                                 [ 75%]
-tests/test_scraper.py ....                                               [ 79%]
-tests/test_skills.py .........                                           [ 88%]
-tests/test_status_tracking.py .....                                      [ 93%]
-tests/test_verifier.py ......                                            [100%]
-
-============================== 99 passed ==============================
+ ============================= 111 passed ==============================
 ```
 
 ---
@@ -314,5 +308,5 @@ tests/test_verifier.py ......                                            [100%]
 
 Built for ethical, truthful career assistance:
 - **Zero Fabrication Guarantee**: The system will never hallucinate or invent skills or projects.
-- **Strict Privacy**: Your candidate profile, resumes, and database remain 100% local on your device.
+- **Strict Privacy**: Your candidate profile (`data/candidate_profile.json`), generated resumes, database, and uploaded media are git-ignored and remain 100% local on your device. See `data/candidate_profile.example.json` for the expected schema.
 - **$0.00 Operational Cost**: Optimized to run fully within Google Gemini Flash and Telegram Bot API free tiers.

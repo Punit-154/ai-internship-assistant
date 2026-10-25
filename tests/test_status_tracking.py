@@ -1,8 +1,10 @@
 ﻿"""Tests for Application Status Tracking and Deadline Queries."""
 
 from datetime import date, timedelta
+
 import pytest
 from sqlmodel import Session
+
 from src.database import (
     get_expired_deadlines,
     get_jobs_by_status,

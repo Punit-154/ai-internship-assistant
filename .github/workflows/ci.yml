@@ -1,0 +1,35 @@
+# Continuous Integration
+#
+# Critical-correctness quality gate applied to every push and pull request:
+# ruff lint (pinned critical rule set in ruff.toml) + the full offline pytest
+# suite. No secrets are required; free GitHub-hosted runners are enough.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff, critical rules)
+        run: ruff check src tests
+
+      - name: Test suite (offline, mocked)
+        run: python -m pytest -q

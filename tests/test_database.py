@@ -1,18 +1,18 @@
 ﻿"""Tests for Database Operations, Deduplication, and Repositories."""
 
 from datetime import date, timedelta
+
 from sqlmodel import Session, select
+
 from src.database import (
     add_watch_target,
     deactivate_watch_target,
-    find_existing_job,
     get_job_by_id,
     get_jobs_needing_deadline_reminder,
     has_scheduler_event,
     list_jobs,
     list_watch_targets,
     log_scheduler_event,
-    purge_duplicate_jobs,
     save_job_posting,
     save_or_update_job_posting,
     save_raw_ingestion,

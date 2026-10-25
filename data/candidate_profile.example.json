@@ -1,0 +1,57 @@
+{
+  "full_name": "Jane Doe",
+  "subtitle": "Computer Science Engineering Undergraduate | Example University",
+  "college": "Example University",
+  "degree": "B.Tech in Computer Science Engineering",
+  "current_college_year": 3,
+  "graduation_year": 2028,
+  "education_dates": "Aug 2024 - Aug 2028 (Expected)",
+  "cgpa": 8.5,
+  "email": "you@example.com",
+  "phone": "+91 0000000000",
+  "linkedin_url": "https://linkedin.com/in/your-handle",
+  "github_url": "https://github.com/your-handle",
+  "portfolio_url": "https://your-portfolio.example.com",
+  "summary": "Computer Science undergraduate (CGPA 8.5/10.0) seeking Software Engineering Intern and Cloud/DevOps Intern roles. Proficient in Python, AWS, and FastAPI, with hands-on experience building RESTful APIs and RAG applications.",
+  "target_roles": [
+    "Software Engineering Intern",
+    "Cloud/DevOps Intern",
+    "Backend Engineering Intern",
+    "Full Stack Developer Intern",
+    "AI/ML Intern"
+  ],
+  "current_availability": "Remote",
+  "summer_locations": [
+    "Bangalore",
+    "Chennai",
+    "Hyderabad"
+  ],
+  "relocation_preference": "Willing to relocate for summer if company provides relocation assistance",
+  "verified_skills": [
+    "Python",
+    "Java",
+    "Git",
+    "SQL",
+    "Docker"
+  ],
+  "verified_projects": [
+    {
+      "title": "Example Project -- Short Impact-Oriented Title",
+      "tech_stack": [
+        "Python",
+        "FastAPI",
+        "PostgreSQL"
+      ],
+      "description": "One-paragraph summary highlighting architecture, key features, and engineering trade-offs.",
+      "github_url": "https://github.com/your-handle/example-project",
+      "date_range": "Jun 2026 - Jul 2026",
+      "bullet_points": [
+        "Quantified, truthful achievement bullet 1.",
+        "Quantified, truthful achievement bullet 2."
+      ]
+    }
+  ],
+  "research_experience": [],
+  "achievements": [],
+  "notes": "Prioritize backend, cloud, and AI engineering opportunities with mentorship."
+}

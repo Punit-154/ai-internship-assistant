@@ -13,14 +13,15 @@ import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
 import httpx
 from google import genai
 from google.genai import types
 
 from src.config import settings
-from src.models.candidate import CandidateProfile, ProjectItem
+from src.models.candidate import ProjectItem
 from src.services.extractor import generate_content_with_fallback, get_genai_client
-from src.services.profile import add_project_to_profile, get_candidate_profile
+from src.services.profile import add_project_to_profile
 
 logger = logging.getLogger(__name__)
 

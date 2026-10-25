@@ -1,19 +1,18 @@
 """Tests for Proactive Discovery Engine (board fetchers + run orchestration)."""
 
-import json
 from typing import Dict
+
 from sqlmodel import Session
-from src.database import add_watch_target, list_watch_targets, save_job_posting
+
+from src.database import add_watch_target, list_watch_targets
 from src.models.job import (
     ApplicationStatus,
     EligibilityStatus,
     JobPosting,
     VerificationStatus,
 )
-from src.models.system import WatchTargetType
 from src.services import discovery
 from src.services.discovery import (
-    DiscoveredListing,
     is_alertable,
     is_internship_title,
     parse_deadline_any_format,

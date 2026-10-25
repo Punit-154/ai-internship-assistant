@@ -1,7 +1,5 @@
 """Tests for domain model validation, defaults, and integrity."""
 
-import pytest
-from pydantic import ValidationError
 from src.models.job import (
     ApplicationStatus,
     EligibilityStatus,

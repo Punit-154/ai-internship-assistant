@@ -1,11 +1,14 @@
 ﻿"""Tests for Telegram Bot Ingestion Adapter (Mocked & Offline)."""
 
 import pytest
+from telegram.ext import CallbackQueryHandler, CommandHandler
+
 from src.config import settings
 from src.interfaces.bot import (
     URL_REGEX,
     build_telegram_app,
     format_job_html_card,
+    get_job_inline_keyboard,
     is_authorized,
 )
 from src.models.job import (
@@ -24,9 +27,16 @@ def test_is_authorized(monkeypatch):
 
 
 def test_is_authorized_no_whitelist_set(monkeypatch):
-    """Verify when whitelist is None, it defaults to open with warning."""
+    """Verify when whitelist is unset, access is denied by default (private bot)."""
     monkeypatch.setattr(settings, "TELEGRAM_ALLOWED_USER_ID", None)
-    assert is_authorized(99999) is True
+    assert is_authorized(99999) is False
+
+
+def test_is_authorized_unknown_user_or_none(monkeypatch):
+    """Verify unknown senders (channels, anonymous admins) are always denied."""
+    monkeypatch.setattr(settings, "TELEGRAM_ALLOWED_USER_ID", 123456789)
+    assert is_authorized(None) is False
+    assert is_authorized(0) is False
 
 
 def test_format_job_html_card():
@@ -74,8 +84,6 @@ def test_build_telegram_app_missing_token(monkeypatch):
     monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "123456789:ABCplaceholder")
     with pytest.raises(ValueError, match="TELEGRAM_BOT_TOKEN is missing or placeholder"):
         build_telegram_app()
-from telegram.ext import CallbackQueryHandler, CommandHandler
-from src.interfaces.bot import get_job_inline_keyboard
 
 
 def test_get_job_inline_keyboard():

@@ -14,16 +14,14 @@ modeled directly on the candidate's master Word/ATS resume layout:
 
 import io
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from reportlab.lib.pagesizes import letter
+from typing import List, Optional
+
 from reportlab.lib import colors
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-)
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from reportlab.platypus.flowables import HRFlowable
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-from reportlab.pdfgen import canvas
 
 from src.models.candidate import CandidateProfile
 
@@ -362,9 +360,9 @@ def generate_resume_pdf(
         portfolio_url=profile.portfolio_url,
     )
 
-    # 2. Professional Summary
-    summary_text = getattr(tailored_llm, "match_rationale", None) or profile.summary
-    if summary_text:
+    # 2. Professional Summary (profile summary; the tailored match_rationale is
+    #    surfaced in the chat/CLI deliverables and audit report, not the resume itself)
+    if profile.summary:
         builder.render_section_header("Professional Summary")
         builder.render_summary(profile.summary)
 

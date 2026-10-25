@@ -7,10 +7,12 @@ leverages DuckDuckGo Search Grounding to discover authentic official career port
 
 import logging
 import re
-from typing import Optional, List, Tuple
+from typing import List, Optional
 from urllib.parse import urlparse
-from pydantic import BaseModel, Field
+
 from ddgs import DDGS
+from pydantic import BaseModel, Field
+
 from src.models.job import VerificationStatus
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,38 @@ TRUSTED_ATS_DOMAINS = {
     "netflix.com",
     "workable.com",
 }
+
+
+def matched_trusted_ats(hostname: Optional[str]) -> Optional[str]:
+    """Return the trusted ATS domain this hostname belongs to, if any.
+
+    Requires exact-domain or proper-subdomain membership so spoofed suffixes
+    (e.g. 'evilgreenhouse.io') are rejected while real subdomains
+    (e.g. 'boards.greenhouse.io') are accepted.
+    """
+    hostname = (hostname or "").lower().rstrip(".")
+    for ats in TRUSTED_ATS_DOMAINS:
+        if hostname == ats or hostname.endswith("." + ats):
+            return ats
+    return None
+
+
+def is_trusted_ats_hostname(hostname: Optional[str]) -> bool:
+    """True if the hostname is exactly or a subdomain of a trusted ATS domain."""
+    return matched_trusted_ats(hostname) is not None
+
+
+def company_matches_hostname(company_name: str, hostname: Optional[str]) -> bool:
+    """True if the company name appears as a standalone token in the hostname.
+
+    Prevents substring false-positives like 'noamazon.com' verifying for 'Amazon';
+    'jobs.amazon.com' or 'amazon-careers.com' still match via token boundaries.
+    """
+    hostname = (hostname or "").lower()
+    cleaned_company = "".join(c for c in company_name.lower() if c.isalnum())
+    if not cleaned_company or not hostname:
+        return False
+    return re.search(rf"(?<![a-z0-9]){re.escape(cleaned_company)}(?![a-z0-9])", hostname) is not None
 
 # Red flag terms indicative of job scams and fraudulent postings
 SCAM_SIGNALS = [
@@ -116,15 +150,13 @@ def search_official_career_portal(company_name: str, role_title: str) -> Optiona
                 parsed = urlparse(href)
                 hostname = (parsed.hostname or "").lower()
 
-                # Check if domain matches trusted ATS
-                for ats in TRUSTED_ATS_DOMAINS:
-                    if hostname.endswith(ats):
-                        logger.info(f"Discovered trusted ATS portal: {href}")
-                        return href
+                match_ats = matched_trusted_ats(hostname)
+                if match_ats:
+                    logger.info(f"Discovered trusted ATS portal: {href}")
+                    return href
 
                 # Check if domain matches company name directly
-                cleaned_company = "".join(c for c in company_name.lower() if c.isalnum())
-                if cleaned_company and cleaned_company in hostname:
+                if company_matches_hostname(company_name, hostname):
                     if any(k in href.lower() for k in ["job", "career", "posting", "role", "position"]):
                         logger.info(f"Discovered official company domain portal: {href}")
                         return href
@@ -169,7 +201,9 @@ def verify_opportunity(
         return VerificationResult(
             is_official=False,
             verification_status=VerificationStatus.SUSPICIOUS,
-            official_portal_url=url,
+            # Never propagate the scam URL as an "official portal" — downstream
+            # pipelines use this field to override the application URL.
+            official_portal_url=None,
             red_flags=red_flags,
             notes=f"CRITICAL WARNING: Potential scam detected. Flags: {'; '.join(red_flags)}",
         )
@@ -179,20 +213,19 @@ def verify_opportunity(
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").lower()
 
-        # Check trusted ATS
-        for ats in TRUSTED_ATS_DOMAINS:
-            if hostname.endswith(ats):
-                return VerificationResult(
-                    is_official=True,
-                    verification_status=VerificationStatus.VERIFIED_OFFICIAL,
-                    official_portal_url=url,
-                    red_flags=[],
-                    notes=f"Verified official ATS portal: {ats}",
-                )
+        # Check trusted ATS (exact domain or proper subdomain only)
+        match_ats = matched_trusted_ats(hostname)
+        if match_ats:
+            return VerificationResult(
+                is_official=True,
+                verification_status=VerificationStatus.VERIFIED_OFFICIAL,
+                official_portal_url=url,
+                red_flags=[],
+                notes=f"Verified official ATS portal: {match_ats}",
+            )
 
-        # Check official company domain
-        cleaned_company = "".join(c for c in company_name.lower() if c.isalnum())
-        if cleaned_company and cleaned_company in hostname:
+        # Check official company domain (standalone-token match)
+        if company_matches_hostname(company_name, hostname):
             return VerificationResult(
                 is_official=True,
                 verification_status=VerificationStatus.VERIFIED_OFFICIAL,
@@ -230,3 +263,20 @@ def verify_opportunity(
         red_flags=[],
         notes="Third-party aggregator or unverified link. No direct official company portal found via search grounding.",
     )
+
+
+def summarize_verification_source(verif: VerificationResult, fallback_url: Optional[str] = None) -> str:
+    """Concise, machine-usable verification source for the DB column.
+
+    The `verification_source` column is documented as the official careers domain
+    or ATS name, so verified jobs store the hostname instead of human prose notes.
+    """
+    if verif.verification_status == VerificationStatus.VERIFIED_OFFICIAL:
+        candidate = verif.official_portal_url or fallback_url
+        if candidate:
+            hostname = (urlparse(candidate).hostname or "").lower().rstrip(".")
+            if hostname.startswith("www."):
+                hostname = hostname[4:]
+            if hostname:
+                return hostname
+    return verif.notes

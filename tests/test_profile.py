@@ -3,7 +3,9 @@
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
+
 import pytest
+
 from src.models.candidate import CandidateProfile, ProjectItem
 from src.models.job import EligibilityStatus
 from src.services.profile import (

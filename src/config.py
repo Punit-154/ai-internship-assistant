@@ -6,6 +6,7 @@ or a local `.env` file, ensuring strict type-safety and early validation.
 
 from pathlib import Path
 from typing import Optional
+
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -84,6 +85,12 @@ class Settings(BaseSettings):
     DISCOVERY_MAX_PER_RUN: int = Field(
         default=8,
         description="Maximum new jobs ingested per watch target per discovery run",
+    )
+
+    # Headless browser rendering (optional Playwright backend)
+    PLAYWRIGHT_ENABLED: bool = Field(
+        default=True,
+        description="Use a locally installed headless Chromium (optional playwright package) to render JavaScript-heavy job pages when static scraping returns an empty shell",
     )
 
     model_config = SettingsConfigDict(

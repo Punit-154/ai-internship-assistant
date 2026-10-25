@@ -2,7 +2,9 @@
 
 import json
 from unittest.mock import MagicMock
+
 import pytest
+
 from src.services.extractor import (
     ExtractedJobData,
     extract_job_from_text,

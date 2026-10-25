@@ -1,10 +1,12 @@
 ﻿"""Tests for Daily Internship Intelligence Digest and Reporting."""
 
 from datetime import date, timedelta
+
 from sqlmodel import Session
+
 from src.database import save_job_posting
 from src.models.candidate import CandidateProfile
-from src.models.job import ApplicationStatus, EligibilityStatus, JobPosting
+from src.models.job import ApplicationStatus, JobPosting
 from src.services.digest import (
     build_daily_digest,
     format_digest_html,
@@ -106,3 +108,68 @@ def test_build_daily_digest_with_data(session: Session):
     text_out = format_digest_text(report)
     assert "Google" in text_out
     assert "2 day(s) left" in text_out
+
+
+def test_digest_urgency_excludes_applied_jobs(session: Session):
+    """Regression: APPLIED jobs closing soon must not trigger 'URGENT: Submit application'."""
+    ref = date(2026, 10, 17)
+
+    applied_urgent = JobPosting(
+        company_name="Netflix",
+        role_title="Backend Intern",
+        locations=["Remote"],
+        application_deadline=ref + timedelta(days=1),
+        allowed_grad_years=[2028],
+        application_status=ApplicationStatus.APPLIED,
+    )
+    open_urgent = JobPosting(
+        company_name="Stripe",
+        role_title="SWE Intern",
+        locations=["Bangalore"],
+        application_deadline=ref + timedelta(days=1),
+        allowed_grad_years=[2028],
+        application_status=ApplicationStatus.NEW,
+    )
+    save_job_posting(session, applied_urgent)
+    save_job_posting(session, open_urgent)
+
+    profile = CandidateProfile(graduation_year=2028, verified_skills=["Python"])
+    report = build_daily_digest(session, profile=profile, ref_date=ref)
+
+    assert any("Stripe" in a for a in report.action_items)
+    assert not any("Netflix" in a and "URGENT" in a for a in report.action_items)
+
+
+def test_digest_high_matches_use_status_query(session: Session):
+    """Regression: digest evaluates open jobs even beyond the newest-100 window."""
+    ref = date(2026, 10, 17)
+    profile = CandidateProfile(graduation_year=2028, verified_skills=["Python"])
+
+    # A very old open opportunity, saved FIRST so it is the least recent row.
+    old_job = JobPosting(
+        company_name="AncientCorp",
+        role_title="Python Intern",
+        locations=["Remote"],
+        allowed_grad_years=[2028],
+        application_status=ApplicationStatus.NEW,
+    )
+    session.add(old_job)
+    session.commit()
+
+    # 105 closed (APPLIED) rows keep coming in after it. A naive
+    # 'list_jobs(limit=100)' window would push the old NEW job out entirely,
+    # while the status-filtered query still evaluates it.
+    for i in range(105):
+        filler = JobPosting(
+            company_name=f"Filler{i}",
+            role_title=f"Word Intern {i}",
+            locations=["X"],
+            allowed_grad_years=[2028],
+            application_status=ApplicationStatus.APPLIED,
+        )
+        session.add(filler)
+    session.commit()
+
+    report = build_daily_digest(session, profile=profile, ref_date=ref)
+    matched_companies = {job.company_name for job, _score in report.high_matches}
+    assert "AncientCorp" in matched_companies

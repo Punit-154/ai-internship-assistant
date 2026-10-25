@@ -15,17 +15,17 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
+
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
-from src.config import settings
 from src.models.candidate import CandidateProfile
 from src.models.job import JobPosting
 from src.services.extractor import generate_content_with_fallback, get_genai_client
 from src.services.github_service import get_all_stored_projects
 from src.services.pdf_generator import generate_resume_pdf
-from src.services.skills import find_matching_skill, match_skill
+from src.services.skills import find_matching_skill
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +146,9 @@ def audit_ats_keywords(
             missing.append(kw)
 
     total = len(target_keywords)
-    pct = (len(matched) / total * 100.0) if total > 0 else 100.0
+    # Zero extracted keywords means nothing was demonstrated: report 0% rather
+    # than a misleading 100% match (e.g. when an LLM extraction came back empty).
+    pct = (len(matched) / total * 100.0) if total > 0 else 0.0
 
     return ATSAuditReport(
         target_keywords=target_keywords,

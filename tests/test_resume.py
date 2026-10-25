@@ -4,6 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
+
 from src.models.candidate import CandidateProfile, ProjectItem
 from src.models.job import JobPosting
 from src.services.resume import (
@@ -120,7 +121,7 @@ def test_tailor_resume_for_job_mocked():
 
 def test_ats_keyword_extraction_and_audit():
     """Verify ATS keywords are extracted from job and audited against profile."""
-    from src.services.resume import extract_ats_keywords_from_job, audit_ats_keywords
+    from src.services.resume import audit_ats_keywords, extract_ats_keywords_from_job
     job = JobPosting(
         role_title="Backend Software Engineering Intern",
         required_skills=["Python", "FastAPI", "PostgreSQL"],
