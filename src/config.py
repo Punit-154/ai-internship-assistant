@@ -93,6 +93,46 @@ class Settings(BaseSettings):
         description="Use a locally installed headless Chromium (optional playwright package) to render JavaScript-heavy job pages when static scraping returns an empty shell",
     )
 
+    # Contact enrichment (Prospeo) — optional; system degrades to manual email entry
+    PROSPEO_API_KEY: Optional[str] = Field(
+        default=None,
+        description="Prospeo API key for verified work-email enrichment (Starter plan required for API access)"
+    )
+
+    # GitHub API (optional personal token raises the 60 req/h unauthenticated limit)
+    GITHUB_TOKEN: Optional[str] = Field(
+        default=None,
+        description="GitHub personal access token used by the alumni/engineer finder"
+    )
+
+    # Approved cold-outreach delivery (Gmail SMTP with an app password)
+    GMAIL_ADDRESS: Optional[str] = Field(
+        default=None,
+        description="Gmail address used to send approved cold-outreach emails"
+    )
+    GMAIL_APP_PASSWORD: Optional[str] = Field(
+        default=None,
+        description="Gmail App Password (NOT the account password) for SMTP delivery"
+    )
+
+    # Outreach rate caps (spam-safety design)
+    OUTREACH_MAX_FIRST_SENDS_PER_DAY: int = Field(
+        default=20,
+        description="Maximum first-contact cold emails approved per day"
+    )
+    OUTREACH_MAX_FOLLOWUPS_PER_DAY: int = Field(
+        default=10,
+        description="Maximum follow-up emails approved per day"
+    )
+    OUTREACH_FOLLOWUP_DAYS: int = Field(
+        default=7,
+        description="Days to wait after a cold email before scheduling the follow-up"
+    )
+    OUTREACH_CHECK_INTERVAL_HOURS: int = Field(
+        default=6,
+        description="How often (hours) the scheduler sweeps for due outreach follow-ups"
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

@@ -18,8 +18,10 @@ import logging
 import re
 from datetime import date, timedelta, timezone
 from datetime import time as dt_time
+from pathlib import Path
 from typing import List, Optional, Tuple
 
+from sqlmodel import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import NetworkError, TimedOut
@@ -49,6 +51,7 @@ from src.database import (
     today_local,
     update_job_application_status,
 )
+from src.models.contact import Contact, OutreachStatus
 from src.models.job import (
     EligibilityStatus,
     IngestionSource,
@@ -56,6 +59,12 @@ from src.models.job import (
     VerificationStatus,
 )
 from src.models.system import SchedulerEventType, WatchTargetType
+from src.services.alumni_finder import AlumniFinderError, build_linkedin_search_urls, find_engineers_on_github
+from src.services.contact_enrichment import (
+    ProspeoError,
+    enrich_linkedin_profile,
+    enrichment_available,
+)
 from src.services.digest import (
     build_daily_digest,
     format_deadline_reminder_html,
@@ -72,6 +81,15 @@ from src.services.github_service import (
     ingest_github_project,
     save_project_to_knowledge_base,
 )
+from src.services.outreach import (
+    OutreachDraft,
+    OutreachError,
+    approve_and_send,
+    craft_outreach_draft,
+    get_contacts_needing_followup,
+    mark_contact_replied,
+    upsert_contact,
+)
 from src.services.pipeline import (
     process_image_pipeline,
     process_text_pipeline,
@@ -82,13 +100,24 @@ from src.services.profile import (
     get_candidate_profile,
     parse_project_from_text,
 )
-from src.services.resume import tailor_resume_for_job
+from src.services.resume import compute_resume_base_name, rebuild_tailored_resume, tailor_resume_for_job
 
 logger = logging.getLogger(__name__)
 
 URL_REGEX = re.compile(
     r"https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)"
 )
+
+# ==============================================================================
+# Approved Cold-Outreach state (P1 Networking)
+# ==============================================================================
+
+# chat_id -> {"draft": OutreachDraft, "contact": Contact, "job": JobPosting}
+_PENDING_DRAFTS: dict = {}
+# chat_id -> {"contact_id": int, "job_id": int, "followup": bool} awaiting replacement text
+_PENDING_DRAFT_EDITS: dict = {}
+# chat_id -> {"linkedin_url": str, "name": str,...} awaiting an enriched Contact to confirm
+_PENDING_ENRICHMENT: dict = {}
 
 
 def is_authorized(user_id: Optional[int]) -> bool:
@@ -239,15 +268,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/addproject - Add a project to your portfolio and auto-sync skills\n"
         "/list - List recently saved opportunities\n"
         "/tailor &lt;id&gt; - Tailor an ATS PDF resume & cold outreach pitch\n"
+        "/fsel &lt;id&gt; &lt;pick&gt; - Re-fit resume page fillers: <code>1,3</code> / <code>none</code> / <code>all</code>\n"
         "/status &lt;id&gt; &lt;status&gt; - Update job application status\n"
         "/deadlines - View approaching deadlines\n"
         "/digest - View daily intelligence briefing\n"
         "/watch - Manage automatic discovery boards (new!)\n"
         "/discover - Run a discovery sweep right now (new!)\n"
+        "/addcontact &lt;email|-LinkedIn&gt; [| Name | Company | Role] - Track a networking contact\n"
+        "/contacts [github &lt;company&gt;] - List contacts / run alumni visibility sweep\n"
+        "/draft &lt;contact_id&gt; [job_id] - Draft an approval-gated cold intro email\n"
+        "/replied &lt;contact_id&gt; - Mark that this contact replied\n"
         "/help - Show this guidance message\n\n"
         f"<i>Auto-scheduled:</i> 🌅 digest at {settings.DIGEST_HOUR_LOCAL:02d}:00 local"
         f" every day, ⏰ deadline reminders every {settings.DEADLINE_CHECK_INTERVAL_HOURS}h,"
-        f" 🛰️ watchlist sweep every {settings.DISCOVERY_CHECK_INTERVAL_HOURS}h."
+        f" 🛰️ watchlist sweep every {settings.DISCOVERY_CHECK_INTERVAL_HOURS}h,"
+        f" 🔁 outreach follow-ups every {settings.OUTREACH_CHECK_INTERVAL_HOURS}h."
     )
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
 
@@ -412,12 +447,101 @@ async def cmd_tailor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                         caption=f"📄 Ready-to-Send PDF Resume for {job.company_name}",
                     )
 
+            # Space-filler review loop: rebuilds from the cached payload cost zero tokens
+            if tailored_res.generated_filler_titles:
+                filler_lines = "\n".join(
+                    f"  <b>{i}.</b> {html.escape(t)}"
+                    for i, t in enumerate(tailored_res.generated_filler_titles, start=1)
+                )
+                await update.message.reply_text(
+                    "🧩 <b>Page-space filler candidates</b> (auto-stacked if the page allows):\n\n"
+                    f"{filler_lines}\n\n"
+                    f"Want control? Reply <code>/fsel {job_id} 1,3</code> or "
+                    f"<code>/fsel {job_id} none</code> to re-fit the PDF with your pick.",
+                    parse_mode=ParseMode.HTML,
+                )
+
         except Exception as exc:
             logger.error(f"Error tailoring resume for job #{job_id}: {exc}")
             await status_msg.edit_text(
                 f"❌ <b>Resume Tailoring Failed:</b>\n<i>{html.escape(str(exc))}</i>",
                 parse_mode=ParseMode.HTML,
             )
+
+
+@requires_authorization
+async def cmd_fsel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /fsel <job_id> <pick> to refit the tailored PDF with a chosen filler subset."""
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "💡 <b>Usage:</b> <code>/fsel &lt;job_id&gt; &lt;pick&gt;</code>\n\n"
+            "<i>Examples:</i>\n"
+            "• <code>/fsel 8 1,3</code> — keep filler projects 1 and 3\n"
+            "• <code>/fsel 8 none</code> — drop every filler project\n"
+            "• <code>/fsel 8 all</code> — restore all generated fillers",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    spec = (args[1] if len(args) > 1 else "all").strip().lower()
+    if spec == "all":
+        keep_fillers = None
+    elif spec == "none":
+        keep_fillers = []
+    elif spec.replace(",", "").isdigit():
+        keep_fillers = [int(x) for x in spec.split(",") if x.strip().isdigit()]
+    else:
+        await update.message.reply_text(
+            f"❌ Invalid pick: <code>{html.escape(spec)}</code>. Use ranks (e.g. <code>1,3</code>), "
+            "<code>none</code>, or <code>all</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    job_id = int(args[0])
+    with get_session() as session:
+        job = get_job_by_id(session, job_id)
+        if not job:
+            await update.message.reply_text(f"❌ Job record #{job_id} not found in database.")
+            return
+
+        profile = get_candidate_profile()
+        payload_path = Path("resumes") / f"{compute_resume_base_name(job)}_payload.json"
+
+        try:
+            rebuilt = await asyncio.to_thread(
+                rebuild_tailored_resume, profile, job, payload_path, keep_fillers
+            )
+        except FileNotFoundError:
+            await update.message.reply_text(
+                f"❌ No cached tailoring payload for Job #{job_id}. Run <code>/tailor {job_id}</code> first.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except ValueError as exc:
+            await update.message.reply_text(f"❌ {html.escape(str(exc))}", parse_mode=ParseMode.HTML)
+            return
+
+        kept = (
+            f"{len(keep_fillers or rebuilt.generated_filler_titles)} of {len(rebuilt.generated_filler_titles)}"
+            if rebuilt.generated_filler_titles
+            else "0"
+        )
+        await update.message.reply_text(
+            f"♻️ <b>Resume re-fitted</b> for {html.escape(job.company_name)}\n"
+            f"🧩 Fillers in PDF: <b>{kept}</b>\n"
+            "<i>Delivering updated PDF:</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        if rebuilt.pdf_file_path and rebuilt.pdf_file_path.exists():
+            with open(rebuilt.pdf_file_path, "rb") as pdf_f:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=pdf_f,
+                    filename=rebuilt.pdf_file_path.name,
+                    caption=f"📄 Updated PDF Resume for {job.company_name}",
+                )
 
 
 @requires_authorization
@@ -572,6 +696,69 @@ def _sync_run_discovery() -> Tuple[list, int]:
         return outcomes, len(targets)
 
 
+def _sync_collect_outreach_followups() -> List[Tuple[int, int]]:
+    """Collect contacts due for a follow-up; detach-safe (ids only)."""
+    with get_session() as session:
+        pairs = get_contacts_needing_followup(session)
+        return [(contact.id, overdue) for contact, overdue in pairs]
+
+
+def _sync_build_followup_draft(contact_id: int):
+    """Blocking follow-up draft builder; returns (html, keyboard, chat-safe payload) or (None, None, None)."""
+    with get_session() as session:
+        contact = session.get(Contact, contact_id)
+        if not contact:
+            return None, None, None
+        job = get_job_by_id(session, contact.last_job_id) if contact.last_job_id else None
+        if not job:
+            latest = session.exec(select(JobPosting).order_by(JobPosting.id.desc())).first()
+            job = latest
+        if not job:
+            return None, None, None
+        try:
+            draft = craft_outreach_draft(contact, job, followup=True)
+        except Exception as exc:
+            logger.error(f"Follow-up draft failed for contact #{contact_id}: {exc}")
+            return None, None, None
+        card_html, keyboard = render_draft_card(draft, contact, job)
+        payload = {"draft": draft, "contact_id": contact.id, "job_id": job.id}
+        return card_html, keyboard, payload
+
+
+async def scheduled_outreach_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback: surface due follow-up drafts for approval (never auto-sends)."""
+    if not settings.SCHEDULER_ENABLED:
+        return
+    chat_id = get_target_chat_id()
+    if not chat_id:
+        return
+    try:
+        due = await asyncio.to_thread(_sync_collect_outreach_followups)
+        if not due:
+            return
+        for contact_id, overdue in due[:3]:
+            card_html, keyboard, payload = await asyncio.to_thread(_sync_build_followup_draft, contact_id)
+            if not card_html:
+                continue
+            _PENDING_DRAFTS[chat_id] = payload
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=card_html,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        days_note = f" (oldest overdue by {due[0][1]}d)" if due and due[0][1] else ""
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🔁 <b>Follow-up time:</b> {len(due)} contact(s) due{days_note}. Approval cards above — "
+            "nothing sends until you tap ✅ Approve.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as exc:
+        logger.error(f"[Scheduler] Outreach follow-up sweep failed: {exc}")
+
+
 async def scheduled_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     """JobQueue callback: deliver the morning intelligence briefing (8AM local)."""
     if not settings.SCHEDULER_ENABLED:
@@ -662,6 +849,7 @@ def schedule_background_jobs(application: Application) -> None:
     - Daily digest at DIGEST_HOUR_LOCAL (Kolkata tz by default)
     - Deadline reminder sweep every DEADLINE_CHECK_INTERVAL_HOURS
     - Watchlist discovery sweep every DISCOVERY_CHECK_INTERVAL_HOURS
+    - Outreach follow-up sweep every OUTREACH_CHECK_INTERVAL_HOURS
     """
     if not settings.SCHEDULER_ENABLED:
         logger.info("[Scheduler] Background scheduling disabled (SCHEDULER_ENABLED=false).")
@@ -691,9 +879,16 @@ def schedule_background_jobs(application: Application) -> None:
         first=90,
         name="discovery_sweep",
     )
+    application.job_queue.run_repeating(
+        scheduled_outreach_check,
+        interval=settings.OUTREACH_CHECK_INTERVAL_HOURS * 3600,
+        first=240,
+        name="outreach_followup_sweep",
+    )
     print(f"[*] Scheduler armed: digest at {settings.DIGEST_HOUR_LOCAL:02d}:00 local | "
           f"deadline sweep every {settings.DEADLINE_CHECK_INTERVAL_HOURS}h | "
-          f"discovery sweep every {settings.DISCOVERY_CHECK_INTERVAL_HOURS}h")
+          f"discovery sweep every {settings.DISCOVERY_CHECK_INTERVAL_HOURS}h | "
+          f"outreach sweep every {settings.OUTREACH_CHECK_INTERVAL_HOURS}h")
 
 
 # ==============================================================================
@@ -861,6 +1056,278 @@ async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(summary, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+# ==============================================================================
+# Approved Cold-Outreach Commands (P1 Networking)
+# ==============================================================================
+
+_OUTREACH_STATUS_ICONS = {
+    OutreachStatus.NONE: "⚪",
+    OutreachStatus.DRAFTED: "✍️",
+    OutreachStatus.SENT: "📤",
+    OutreachStatus.FOLLOWED_UP: "🔁",
+    OutreachStatus.REPLIED: "📩",
+}
+
+
+def _format_contact_line(contact: Contact) -> str:
+    icon = _OUTREACH_STATUS_ICONS.get(contact.outreach_status, "⚪")
+    company = f" @ {html.escape(contact.company_name)}" if contact.company_name else ""
+    role = f" ({html.escape(contact.role_title)})" if contact.role_title else ""
+    relation = f" | {html.escape(contact.relationship)}" if contact.relationship else ""
+    email_bit = f"\n    📧 <code>{html.escape(contact.email)}</code>" if contact.email else "\n    ⚠️ no email stored"
+    li_bit = f"\n    🔗 {html.escape(contact.linkedin_url)}" if contact.linkedin_url else ""
+    return f"{icon} <b>#{contact.id} {html.escape(contact.full_name)}</b>{company}{role}{relation}{email_bit}{li_bit}"
+
+
+def render_draft_card(draft: OutreachDraft, contact: Contact, job: JobPosting):
+    """Build the approval-card HTML + keyboard for a pending outreach draft."""
+    contact_label = f"{contact.full_name}" + (f" @ {contact.company_name}" if contact.company_name else "")
+    kind = "🔁 FOLLOW-UP" if draft.is_followup else "✍️ FIRST CONTACT"
+    card_html = (
+        f"📧 <b>COLD OUTREACH DRAFT</b> ({kind})\n\n"
+        f"👤 <b>To:</b> {html.escape(contact_label)}"
+        + (f" ({html.escape(contact.email)})" if contact.email else " <i>(no email!)</i>")
+        + f"\n🎯 <b>Re:</b> {html.escape(job.company_name)} — {html.escape(job.role_title)}\n\n"
+        f"<b>Subject:</b> {html.escape(draft.subject)}\n\n"
+        f"<pre>{html.escape(draft.body)}</pre>\n\n"
+        "<i>✅ Approve sends via your Gmail. ✏️ Edit replaces the text. 🗑 Discard deletes it.</i>"
+    )
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Approve & Send", callback_data=f"outreach:approve:{contact.id}"),
+            InlineKeyboardButton("✏️ Edit", callback_data=f"outreach:edit:{contact.id}"),
+            InlineKeyboardButton("🗑 Discard", callback_data=f"outreach:discard:{contact.id}"),
+        ]]
+    )
+    return card_html, keyboard
+
+
+def _sync_latest_job_id(session) -> Optional[int]:
+    row = session.exec(select(JobPosting.id).order_by(JobPosting.id.desc())).first()
+    return row if row else None
+
+
+@requires_authorization
+async def cmd_addcontact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /addcontact <email-or-linkedin> [| Full Name [| Company [| Role [| relationship]]]]."""
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        enrich_state = "ON (Prospeo)" if enrichment_available() else "OFF (set PROSPEO_API_KEY in .env)"
+        await update.message.reply_text(
+            "🤝 <b>Add a networking contact</b>\n\n"
+            "<b>Usage:</b>\n"
+            "• <code>/addcontact recruiter@company.com | Jane Doe | Google | Recruiter | recruiter</code>\n"
+            "• <code>/addcontact https://linkedin.com/in/janedoe</code> "
+            "— auto-enriches email via Prospeo\n\n"
+            "Only the first field is required; later fields fill blanks on duplicate. "
+            f"Prospeo enrichment: <b>{enrich_state}</b>. List: /contacts",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    parts = [p.strip() for p in raw.split("|")]
+    identifier = parts[0]
+    full_name = parts[1] if len(parts) > 1 and parts[1] else ""
+    company_name = parts[2] if len(parts) > 2 and parts[2] else None
+    role_title = parts[3] if len(parts) > 3 and parts[3] else None
+    relationship = parts[4] if len(parts) > 4 and parts[4] else ""
+
+    if "linkedin.com/in/" in identifier:
+        if not enrichment_available():
+            await update.message.reply_text(
+                "❌ LinkedIn lookup needs <code>PROSPEO_API_KEY</code> in .env (Starter plan gives API access).\n"
+                "💡 Until then add contacts by email: <code>/addcontact jane@company.com | Jane | ...</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        status_msg = await update.message.reply_text("🛰️ <i>Enriching profile via Prospeo (1 credit)...</i>", parse_mode=ParseMode.HTML)
+        try:
+            enriched = await asyncio.to_thread(enrich_linkedin_profile, identifier)
+        except ProspeoError as exc:
+            await status_msg.edit_text(
+                f"❌ <b>Enrichment failed:</b>\n<i>{html.escape(str(exc))}</i>\n\n"
+                "Try adding by email instead: <code>/addcontact jane@company.com | Jane</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        with get_session() as session:
+            contact, created = upsert_contact(
+                session,
+                full_name=enriched.full_name or full_name,
+                company_name=enriched.company_name or company_name,
+                role_title=enriched.role_title or role_title,
+                relationship=relationship,
+                email=enriched.email or None,
+                linkedin_url=identifier,
+                source="prospeo",
+                email_status="prospeo_verified" if enriched.email else "unverified",
+            )
+        await status_msg.edit_text(
+            f"✅ <b>Contact {'saved' if created else 'updated'}: {html.escape(contact.full_name)}</b>\n"
+            f"📧 {html.escape(contact.email or '(no email found)')} | 🏢 {html.escape(contact.company_name or '—')}\n"
+            f"💼 {html.escape(contact.role_title or '—')}\n\n"
+            "<i>Draft an intro:</i> <code>/draft " + str(contact.id) + "</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if "@" not in identifier or identifier.startswith("@"):
+        await update.message.reply_text(
+            "❌ First field must be an email or LinkedIn URL.\n"
+            "<code>/addcontact recruiter@company.com | Jane Doe | Company | Role | recruiter</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    with get_session() as session:
+        contact, created = upsert_contact(
+            session,
+            full_name=full_name,
+            company_name=company_name,
+            role_title=role_title,
+            relationship=relationship,
+            email=identifier,
+            source="manual",
+            email_status="unverified",
+        )
+    await update.message.reply_text(
+        f"✅ <b>Contact {'saved' if created else 'updated'}: {html.escape(contact.full_name)}</b>\n"
+        + _format_contact_line(contact)
+        + "\n\n<i>Draft an intro:</i> <code>/draft " + str(contact.id) + "</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@requires_authorization
+async def cmd_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /contacts [github <company>] — list tracked contacts or run a GitHub sweep."""
+    args = context.args or []
+    if args and args[0].lower() == "github":
+        if len(args) < 2:
+            await update.message.reply_text(
+                "💡 Usage: <code>/contacts github &lt;company&gt;</code> — e.g. <code>/contacts github Stripe</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        company = " ".join(args[1:])
+        status_msg = await update.message.reply_text(
+            f"🛰️ <i>Searching public GitHub for engineers at {html.escape(company)}...</i>", parse_mode=ParseMode.HTML
+        )
+        try:
+            engineers = await asyncio.to_thread(find_engineers_on_github, company)
+        except AlumniFinderError as exc:
+            await status_msg.edit_text(f"❌ GitHub sweep failed: {html.escape(str(exc))}", parse_mode=ParseMode.HTML)
+            return
+        urls = build_linkedin_search_urls(company)
+        lines = [f"🛰️ <b>{html.escape(company)} — VIT-alumn Visibility Report</b>\n"]
+        if engineers:
+            lines.append("<b>Engineers with GitHub presence:</b>")
+            for eng in engineers:
+                lines.append(f"• <b>{html.escape(eng.full_name)}</b> — 🔗 {html.escape(eng.github_url)}")
+        else:
+            lines.append("<i>No public GitHub hits (most recruiters/alumni don't list code profiles).</i>")
+        lines.append("\n<b>LinkedIn pre-search links (paste results → /addcontact):</b>")
+        lines.append(f"• VIT alumni at {html.escape(company)}: {html.escape(urls['alumni'])}")
+        lines.append(f"• Recruiters at {html.escape(company)}: {html.escape(urls['recruiters'])}")
+        lines.append(f"• Engineers at {html.escape(company)}: {html.escape(urls['engineers'])}")
+        await status_msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+
+    with get_session() as session:
+        contacts = session.exec(select(Contact).order_by(Contact.id.desc())).all()
+    if not contacts:
+        await update.message.reply_text(
+            "🤝 <b>Networking book is empty.</b>\nAdd one: <code>/addcontact jane@company.com | Jane | Company | Role | recruiter</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = ["🤝 <b>Networking Contacts:</b>\n"]
+    for contact in contacts:
+        lines.append(_format_contact_line(contact))
+    sent = sum(1 for c in contacts if c.outreach_status in (OutreachStatus.SENT, OutreachStatus.FOLLOWED_UP))
+    replied = sum(1 for c in contacts if c.outreach_status == OutreachStatus.REPLIED)
+    lines.append(
+        f"\nTotal: <b>{len(contacts)}</b> | emailed: <b>{sent}</b> | replied: <b>{replied}</b>\n"
+        "<i>Draft: /draft &lt;id&gt; | Mark reply: /replied &lt;id&gt; | Sweep: /contacts github &lt;company&gt;</i>"
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+@requires_authorization
+async def cmd_draft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /draft <contact_id> [job_id] — generate an approval-gated cold email draft."""
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "💡 Usage: <code>/draft &lt;contact_id&gt; [job_id]</code>\n"
+            "<i>Job defaults to your most recently ingested posting. List contacts: /contacts</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    contact_id = int(args[0])
+    chat_id = update.effective_chat.id
+
+    with get_session() as session:
+        contact = session.get(Contact, contact_id)
+        if not contact:
+            await update.message.reply_text(f"❌ Contact #{contact_id} not found. List: /contacts")
+            return
+        if contact.freeze_followups:
+            await update.message.reply_text(
+                f"🧊 Follow-ups are frozen for {html.escape(contact.full_name)}. Clear <code>freeze_followups</code> in the contacts table to unfreeze."
+            )
+            return
+        if not contact.email and not enrichment_available():
+            await update.message.reply_text(
+                f"❌ {html.escape(contact.full_name)} has no email stored. "
+                "Add <code>PROSPEO_API_KEY</code> + <code>/addcontact &lt;linkedin&gt;</code>, or re-add with an email.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        job_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+        job = get_job_by_id(session, job_id) if job_id else None
+        if not job:
+            latest_id = _sync_latest_job_id(session)
+            job = get_job_by_id(session, latest_id) if latest_id else None
+        if not job:
+            await update.message.reply_text("❌ No jobs in the pipeline yet — send a posting link first.")
+            return
+        job_copy = job
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    status_msg = await update.message.reply_text("✍️ <i>Drafting a truthful cold intro with Gemini...</i>", parse_mode=ParseMode.HTML)
+    try:
+        draft = await asyncio.to_thread(craft_outreach_draft, contact, job_copy)
+    except Exception as exc:
+        logger.error(f"Draft generation failed for contact #{contact_id}: {exc}")
+        await status_msg.edit_text(f"❌ Drafting failed: {html.escape(str(exc))}", parse_mode=ParseMode.HTML)
+        return
+
+    card_html, keyboard = render_draft_card(draft, contact, job_copy)
+    _PENDING_DRAFTS[chat_id] = {"draft": draft, "contact_id": contact.id, "job_id": job_copy.id}
+    await status_msg.edit_text(card_html, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
+
+
+@requires_authorization
+async def cmd_replied(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /replied <contact_id> — mark that this contact answered."""
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("💡 Usage: <code>/replied &lt;contact_id&gt;</code> (list: /contacts)")
+        return
+    with get_session() as session:
+        contact = mark_contact_replied(session, int(args[0]))
+    if contact:
+        await update.message.reply_text(
+            f"🎉 <b>Reply logged from {html.escape(contact.full_name)}</b> — keep notes in the Contact card."
+            "\n<i>Next: prepare talking points before responding.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(f"❌ Contact #{args[0]} not found.")
+
+
 @requires_authorization
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle interactive button clicks from job cards."""
@@ -936,6 +1403,56 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     logger.error(f"Error tailoring resume from callback #{job_id}: {exc}")
                     await query.message.reply_text(f"❌ Tailoring failed: {html.escape(str(exc))}")
 
+    elif data.startswith("outreach:"):
+        parts = data.split(":")  # outreach:approve|edit|discard:<contact_id>
+        action = parts[1] if len(parts) > 1 else ""
+        contact_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        chat_id = update.effective_chat.id
+        pending = _PENDING_DRAFTS.get(chat_id)
+
+        if action == "approve":
+            if not pending or pending.get("contact_id") != contact_id:
+                await query.answer("This draft is no longer in memory — run /draft again.", show_alert=True)
+                return
+            draft = pending["draft"]
+            try:
+                with get_session() as session:
+                    updated_contact = await asyncio.to_thread(
+                        approve_and_send, session, contact_id, draft.subject, draft.body, draft.is_followup
+                    )
+            except OutreachError as exc:
+                await query.answer(f"❌ {exc}", show_alert=True)
+                return
+            _PENDING_DRAFTS.pop(chat_id, None)
+            followup_date = today_local() + timedelta(days=settings.OUTREACH_FOLLOWUP_DAYS)
+            await query.answer("📧 Email sent!")
+            await query.edit_message_text(
+                f"✅ <b>Email sent to {html.escape(updated_contact.full_name)}</b>\n"
+                f"🔁 <i>Follow-up card will surface on/after {followup_date.strftime('%b %d')} "
+                "(scheduler sweeps every " + str(settings.OUTREACH_CHECK_INTERVAL_HOURS) + "h) — nothing auto-sends.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif action == "discard":
+            _PENDING_DRAFTS.pop(chat_id, None)
+            _PENDING_DRAFT_EDITS.pop(chat_id, None)
+            try:
+                await query.answer("🗑 Draft discarded.")
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception as exc:
+                logger.debug(f"Discard cleanup: {exc}")
+
+        elif action == "edit":
+            if not pending or pending.get("contact_id") != contact_id:
+                await query.answer("This draft is no longer in memory — run /draft again.", show_alert=True)
+                return
+            _PENDING_DRAFT_EDITS[chat_id] = {"contact_id": contact_id, "job_id": pending.get("job_id"), "followup": pending["draft"].is_followup}
+            await query.answer()
+            await query.message.reply_text(
+                "✏️ <b>Paste the replacement email now</b> — first line becomes the subject, the rest is the body.",
+                parse_mode=ParseMode.HTML,
+            )
+
 
 # ==============================================================================
 # Message Ingestion Handlers (URLs, Plain Text, Screenshots, PDFs)
@@ -946,6 +1463,35 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Process incoming text messages, auto-detecting URLs vs raw job forwards."""
     text = update.message.text.strip()
     if not text:
+        return
+
+    chat_id = update.effective_chat.id
+
+    # Outreach draft-edit interception: the next text replaces a pending draft.
+    pending_edit = _PENDING_DRAFT_EDITS.get(chat_id)
+    if pending_edit:
+        lines = text.splitlines()
+        if len(lines) < 2 or not lines[0].strip() or not text[len(lines[0]):].strip():
+            await update.message.reply_text(
+                "⚠️ Needed: <b>first line = subject</b>, then a blank line or body line, e.g.\n"
+                "<code>Interested in the Data Intern role\n\nHi Sarah, ...</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        subject, body = lines[0].strip(), text[len(lines[0]):].strip()
+        _PENDING_DRAFT_EDITS.pop(chat_id, None)
+        pending = _PENDING_DRAFTS.get(chat_id)
+        if pending and pending.get("contact_id") == pending_edit["contact_id"]:
+            draft = pending["draft"]
+            draft.subject, draft.body = subject, body
+            with get_session() as session:
+                contact = session.get(Contact, pending_edit["contact_id"])
+                job = get_job_by_id(session, pending_edit["job_id"])
+            if contact and job:
+                card_html, keyboard = render_draft_card(draft, contact, job)
+                await update.message.reply_text(card_html, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True)
+                return
+        await update.message.reply_text("❌ Original draft was lost — run <code>/draft &lt;contact_id&gt;</code> again.", parse_mode=ParseMode.HTML)
         return
 
     url_match = URL_REGEX.search(text)
@@ -1103,11 +1649,16 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("addproject", cmd_add_project))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("tailor", cmd_tailor))
+    app.add_handler(CommandHandler("fsel", cmd_fsel))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("deadlines", cmd_deadlines))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("watch", cmd_watch))
     app.add_handler(CommandHandler("discover", cmd_discover))
+    app.add_handler(CommandHandler("addcontact", cmd_addcontact))
+    app.add_handler(CommandHandler("contacts", cmd_contacts))
+    app.add_handler(CommandHandler("draft", cmd_draft))
+    app.add_handler(CommandHandler("replied", cmd_replied))
 
     # Inline Keyboard Button Clicks
     app.add_handler(CallbackQueryHandler(handle_callback_query))
@@ -1134,7 +1685,8 @@ def run_telegram_bot() -> None:
     print(f"[*] Whitelisted Telegram User ID: {whitelist_state}")
     print("[*] Resilient HTTP timeouts: 30s connect / 30s read")
     print("[*] Resume Tailoring enabled (/tailor <id>)")
-    print("[*] Background jobs: 8AM digest | deadline reminders | watchlist discovery")
+    print("[*] Approved cold-outreach enabled (/addcontact /contacts /draft /replied)")
+    print("[*] Background jobs: 8AM digest | deadline reminders | watchlist discovery | outreach follow-ups")
     print("    Manage boards with /watch | manual sweep with /discover")
     app = build_telegram_app()
     app.run_polling(drop_pending_updates=True)

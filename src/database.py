@@ -11,6 +11,7 @@ from sqlalchemy import func
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from src.config import settings
+from src.models.contact import Contact  # noqa: F401  (model imported for table registration)
 from src.models.job import ApplicationStatus, IngestionSource, JobPosting, RawIngestion
 from src.models.system import SchedulerEventType, SchedulerLog, WatchTarget, WatchTargetType
 
@@ -302,6 +303,21 @@ def has_scheduler_event(
         SchedulerLog.sent_date == sent_date,
     )
     return session.exec(stmt).first() is not None
+
+
+def count_scheduler_events(
+    session: Session,
+    event_type: SchedulerEventType,
+    event_key: str,
+    sent_date: date,
+) -> int:
+    """Count how many times an event fired for a key on a date (daily rate caps)."""
+    stmt = select(SchedulerLog).where(
+        SchedulerLog.event_type == event_type,
+        SchedulerLog.event_key == event_key,
+        SchedulerLog.sent_date == sent_date,
+    )
+    return len(list(session.exec(stmt).all()))
 
 
 def log_scheduler_event(
