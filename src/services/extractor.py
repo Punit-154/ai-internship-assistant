@@ -126,15 +126,41 @@ def generate_content_with_fallback(
     raise last_exc
 
 
-def get_genai_client() -> genai.Client:
-    """Initialize and return the Google GenAI Client."""
-    api_key = settings.GEMINI_API_KEY
+AI_STUDIO_KEY_PREFIX = "AIza"
+AI_STUDIO_KEY_MIN_LEN = 30
+
+
+def validate_gemini_api_key(api_key: Optional[str]) -> str:
+    """Reject credential types the Generative Language API cannot accept.
+
+    Real AI Studio API keys start with 'AIza' and are ~39 characters long.
+    Anything else (e.g. Gemini CLI access tokens starting 'AQ.', OAuth tokens,
+    or truncated strings) reaches the API and fails with an opaque
+    401 UNAUTHENTICATED / ACCESS_TOKEN_TYPE_UNSUPPORTED — fail fast instead
+    with instructions pointing at the key-generation page.
+    """
     if not api_key or api_key.startswith("AIzaSy_your_gemini"):
         raise ValueError(
             "GEMINI_API_KEY is missing or invalid in your .env file.\n"
-            "Please obtain a free key from https://aistudio.google.com/ and set it in .env"
+            "Get a free API key at https://aistudio.google.com/apikey "
+            "and set GEMINI_API_KEY=<AIzaSy...> in .env"
         )
-    return genai.Client(api_key=api_key)
+    if not api_key.startswith(AI_STUDIO_KEY_PREFIX) or len(api_key) < AI_STUDIO_KEY_MIN_LEN:
+        head = api_key[:5] + "..."
+        raise ValueError(
+            f"GEMINI_API_KEY does not look like an AI Studio API key "
+            f"(got {len(api_key)} chars starting '{head}').\n"
+            "AI Studio keys start with 'AIza'. Access tokens (starting 'AQ.') are "
+            "NOT supported by this API.\n"
+            "Create an API key at https://aistudio.google.com/apikey and "
+            "set GEMINI_API_KEY=<AIzaSy...> in .env"
+        )
+    return api_key
+
+
+def get_genai_client() -> genai.Client:
+    """Initialize and return the Google GenAI Client."""
+    return genai.Client(api_key=validate_gemini_api_key(settings.GEMINI_API_KEY))
 
 
 def extract_job_from_text(

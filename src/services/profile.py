@@ -17,6 +17,7 @@ from google.genai import types
 from src.config import settings
 from src.models.candidate import CandidateProfile, ProjectItem
 from src.models.job import EligibilityStatus
+from src.services.extractor import validate_gemini_api_key
 from src.services.skills import find_matching_skill
 
 logger = logging.getLogger(__name__)
@@ -111,9 +112,7 @@ def parse_project_from_text(
         raise ValueError("Project description is too short.")
 
     if not client:
-        api_key = settings.GEMINI_API_KEY
-        if not api_key or api_key.startswith("AIzaSy_your_gemini"):
-            raise ValueError("GEMINI_API_KEY is missing or invalid in your .env file.")
+        api_key = validate_gemini_api_key(settings.GEMINI_API_KEY)
         client = genai.Client(api_key=api_key)
 
     target_model = model_name or settings.GEMINI_MODEL
