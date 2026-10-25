@@ -24,7 +24,7 @@ from src.models.candidate import CandidateProfile
 from src.models.job import JobPosting
 from src.services.extractor import generate_content_with_fallback, get_genai_client
 from src.services.github_service import get_all_stored_projects
-from src.services.pdf_generator import generate_resume_pdf
+from src.services.pdf_generator import _MAX_FILLER_CANDIDATES, generate_resume_pdf
 from src.services.skills import find_matching_skill
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,10 @@ class TailoredProjectItem(BaseModel):
         description="2-3 quantified, action-oriented bullet points using Google X-Y-Z formula naturally incorporating verified ATS keywords"
     )
     github_url: Optional[str] = Field(default=None, description="GitHub URL if available")
+    is_filler: bool = Field(
+        default=False,
+        description="Set true only for secondary candidates stacked after the 3 primary projects; fillers get one truthful bullet each and are page-space fitted",
+    )
 
 
 class ResumeTailorLLMResponse(BaseModel):
@@ -56,7 +60,10 @@ class ResumeTailorLLMResponse(BaseModel):
     frameworks: List[str] = Field(description="Frameworks and libraries from candidate verified skills, prioritized for this job")
     tools_and_cloud: List[str] = Field(description="Developer tools, databases, and cloud from candidate verified skills")
     core_concepts: List[str] = Field(description="Computer science concepts and methodologies from candidate verified skills")
-    tailored_projects: List[TailoredProjectItem] = Field(description="Up to 3 top matching projects selected strictly from candidate verified projects")
+    tailored_projects: List[TailoredProjectItem] = Field(
+        description="3 top matching projects as primary entries, followed by up to 3 secondary "
+        "filler candidates (is_filler=true, one truthful bullet each) from candidate verified projects/KB"
+    )
     linkedin_referral_pitch: str = Field(
         description="A polite, crisp (<100 words) LinkedIn outreach/referral request for alumni or recruiters at the company"
     )
@@ -79,6 +86,32 @@ class TailoredResumeResult:
     match_rationale: str
     matching_skills: List[str]
     ats_audit: ATSAuditReport
+    payload_file_path: Optional[Path] = None
+    generated_filler_titles: List[str] = field(default_factory=list)
+
+
+def compute_resume_base_name(job: JobPosting) -> str:
+    """Deterministic output filename stem used by both tailor and filler rebuilds."""
+    safe_company = "".join(c for c in job.company_name if c.isalnum() or c in ("-", "_")).strip() or "Company"
+    safe_role = "".join(c for c in job.role_title if c.isalnum() or c in ("-", "_")).strip() or "Role"
+    return f"Resume_{safe_company}_{safe_role}_Job{job.id}"
+
+
+def _purge_extra_fillers(response: ResumeTailorLLMResponse) -> int:
+    """Keep only the top-_MAX_FILLER_CANDIDATES ranked add-on projects, in place."""
+    primary = [t for t in response.tailored_projects if not t.is_filler]
+    fillers = [t for t in response.tailored_projects if t.is_filler]
+    if len(fillers) <= _MAX_FILLER_CANDIDATES:
+        return 0
+    purged = fillers[_MAX_FILLER_CANDIDATES:]
+    response.tailored_projects = primary + fillers[:_MAX_FILLER_CANDIDATES]
+    logger.info(
+        "Purged %d extra filler candidate(s) over the cap of %d: %s",
+        len(purged),
+        _MAX_FILLER_CANDIDATES,
+        ", ".join(f"'{t.title}'" for t in purged),
+    )
+    return len(purged)
 
 
 def extract_ats_keywords_from_job(job: JobPosting) -> List[str]:
@@ -270,8 +303,10 @@ Missing Skills (DO NOT INVENT): {json.dumps(ats_audit.missing_keywords)}
 RULES:
 1. STRICT ZERO-FABRICATION: You may ONLY use skills and projects present in the candidate's verified profile or GitHub knowledge base. NEVER invent companies, degrees, dates, tools, or technologies.
 2. ATS TAILORING & KEYWORD ALIGNMENT: Prioritize matched ATS keywords in technical skills. Frame project bullet points using Google X-Y-Z formula ('Accomplished [X] measured by [Y] by doing [Z]') emphasizing verified matched keywords.
-3. REFERRAL PITCH: Draft a crisp (<100 words), polite LinkedIn message to VIT alumni or recruiters requesting a referral.
-4. COLD EMAIL: Draft a concise (<120 words) email with subject line to the hiring team.
+3. PRIMARY PROJECTS: Select exactly 3 projects as primary entries (is_filler=false) with 2-3 X-Y-Z bullet points each, ranked by relevance to this role.
+4. FILLER CANDIDATES: Additionally return up to 3 secondary projects (is_filler=true) ranked by honest overlap with the posting (shared verified stacks or adjacent engineering value). Each filler gets exactly ONE truthful, concise bullet drawn from its knowledge base. These are stacked into leftover page space only if it fits; never fabricate relevance.
+5. REFERRAL PITCH: Draft a crisp (<100 words), polite LinkedIn message to VIT alumni or recruiters requesting a referral.
+6. COLD EMAIL: Draft a concise (<120 words) email with subject line to the hiring team.
 """
 
     response = generate_content_with_fallback(
@@ -285,6 +320,10 @@ RULES:
     )
 
     tailored_llm = ResumeTailorLLMResponse.model_validate_json(response.text)
+
+    # Locked policy: at most 3 add-on (is_filler) candidates — extras are purged before
+    # payload persistence so PDF, markdown, and /fsel ranks all agree.
+    _purge_extra_fillers(tailored_llm)
 
     # Attach github URLs from verified profile if available
     project_github_map = {
@@ -304,14 +343,16 @@ RULES:
     markdown_content = render_resume_markdown(profile, job, tailored_llm, ats_audit)
 
     # Clean filenames
-    safe_company = "".join(c for c in job.company_name if c.isalnum() or c in ("-", "_")).strip() or "Company"
-    safe_role = "".join(c for c in job.role_title if c.isalnum() or c in ("-", "_")).strip() or "Role"
-    base_filename = f"Resume_{safe_company}_{safe_role}_Job{job.id}"
+    base_filename = compute_resume_base_name(job)
 
     md_path = output_dir / f"{base_filename}.md"
     pdf_path = output_dir / f"{base_filename}.pdf"
 
     md_path.write_text(markdown_content, encoding="utf-8")
+
+    # Persist the structured LLM payload so filler selection rebuilds never cost a token
+    payload_path = output_dir / f"{base_filename}_payload.json"
+    payload_path.write_text(tailored_llm.model_dump_json(), encoding="utf-8")
 
     # Guaranteed Pure-Python ATS PDF Generation
     generate_resume_pdf(profile, tailored_llm, pdf_path)
@@ -329,4 +370,72 @@ RULES:
         match_rationale=tailored_llm.match_rationale,
         matching_skills=ats_audit.matched_keywords,
         ats_audit=ats_audit,
+        payload_file_path=payload_path,
+        generated_filler_titles=[t.title for t in tailored_llm.tailored_projects if t.is_filler],
+    )
+
+
+def rebuild_tailored_resume(
+    profile: CandidateProfile,
+    job: JobPosting,
+    payload_path: Path,
+    keep_fillers: Optional[List[int]] = None,
+) -> TailoredResumeResult:
+    """Re-render a tailored resume from the cached LLM payload with a chosen filler subset.
+
+    Zero LLM cost: the original structured response is replayed from
+    ``<base>_payload.json`` written by ``tailor_resume_for_job``.
+
+    Args:
+        keep_fillers: 1-based ranks into the payload's is_filler list to include.
+            ``None`` keeps every generated filler (default full fit), ``[]`` drops all.
+    """
+    if not payload_path.exists():
+        raise FileNotFoundError(
+            f"Payload not found: {payload_path}. Run /tailor first to generate the original response."
+        )
+    payload = ResumeTailorLLMResponse.model_validate_json(payload_path.read_text(encoding="utf-8"))
+    # Trim legacy payloads (written before the 3-filler lock) so /fsel ranks stay 1-3
+    _purge_extra_fillers(payload)
+    filler_pool = [t for t in payload.tailored_projects if t.is_filler]
+
+    if keep_fillers is None:
+        kept_fillers = filler_pool
+    else:
+        invalid = [r for r in keep_fillers if r < 1 or r > len(filler_pool)]
+        if invalid:
+            raise ValueError(f"Invalid filler ranks {invalid}; payload has {len(filler_pool)} fillers.")
+        kept_fillers = [filler_pool[r - 1] for r in sorted(set(keep_fillers))]
+
+    payload.tailored_projects = [t for t in payload.tailored_projects if not t.is_filler] + kept_fillers
+
+    stored_projects = get_all_stored_projects()
+    target_keywords = extract_ats_keywords_from_job(job)
+    ats_audit = audit_ats_keywords(target_keywords, profile, stored_projects)
+
+    markdown_content = render_resume_markdown(profile, job, payload, ats_audit)
+    output_dir = payload_path.parent
+    base_filename = compute_resume_base_name(job)
+
+    md_path = output_dir / f"{base_filename}.md"
+    pdf_path = output_dir / f"{base_filename}.pdf"
+    md_path.write_text(markdown_content, encoding="utf-8")
+
+    generate_resume_pdf(profile, payload, pdf_path)
+    logger.info(f"Rebuilt tailored resume with {len(kept_fillers)}/{len(filler_pool)} fillers at: {pdf_path}")
+
+    return TailoredResumeResult(
+        job_id=job.id or 0,
+        company_name=job.company_name,
+        role_title=job.role_title,
+        pdf_file_path=pdf_path,
+        md_file_path=md_path,
+        markdown_content=markdown_content,
+        linkedin_referral_pitch=payload.linkedin_referral_pitch,
+        cold_email_draft=payload.cold_email_draft,
+        match_rationale=payload.match_rationale,
+        matching_skills=ats_audit.matched_keywords,
+        ats_audit=ats_audit,
+        payload_file_path=payload_path,
+        generated_filler_titles=[t.title for t in filler_pool],
     )

@@ -14,7 +14,7 @@ modeled directly on the candidate's master Word/ATS resume layout:
 
 import io
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
@@ -24,6 +24,52 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from reportlab.platypus.flowables import HRFlowable
 
 from src.models.candidate import CandidateProfile
+
+_FRAME_PADDING = 6.0  # ReportLab Frame default inner padding (all sides)
+_BOTTOM_BREATHING_ROOM_IN = 0.45  # guaranteed breathing room left under filled content
+_MAX_FILLER_CANDIDATES = 3  # locked call: only 3 add-on (is_filler) projects, extras purged
+_MAX_WRAP_HEIGHT = 100000.0  # effectively unbounded wrapping budget for estimation
+
+# Diagnostics of the most recent generate_resume_pdf run (fit decisions and estimates)
+_LAST_FIT_STATS = {
+    "page_budget": 0.0,
+    "usable_h": 0.0,
+    "est_prefix": 0.0,
+    "tail_h": 0.0,
+    "est_primary_total": 0.0,
+    "fillers_included": 0,
+    "fill_left": 0.0,
+    "estimated_total": 0.0,
+}
+
+
+def usable_frame_geometry(builder: "PDFResumeBuilder") -> Tuple[float, float]:
+    """Content width/height inside the SimpleDocTemplate Frame, accounting for padding."""
+    width = letter[0] - builder.left_margin - builder.right_margin - 2 * _FRAME_PADDING
+    height = letter[1] - builder.top_margin - builder.bottom_margin - 2 * _FRAME_PADDING
+    return width, height
+
+
+def estimate_flowable_height(flowable, usable_width: float, prev_space_after: float = 0.0) -> float:
+    """Merged ReportLab wrap height for one flowable given the previous flowable's spaceAfter.
+
+    Mirrors ReportLab Frame._add semantics: the vertical gap before a flowable is
+    max(its own spaceBefore, the previous flowable's spaceAfter).
+    """
+    _w, h = flowable.wrap(usable_width, _MAX_WRAP_HEIGHT)
+    gap = max(flowable.getSpaceBefore() or 0, prev_space_after or 0)
+    return h + gap
+
+
+def estimate_story_height(story: List, usable_width: float) -> float:
+    """Measured height of a ReportLab story sequence when appended to one frame."""
+    total = 0.0
+    prev_after = 0.0
+    for f in story:
+        _w, h = f.wrap(usable_width, _MAX_WRAP_HEIGHT)
+        total += h + max(f.getSpaceBefore() or 0, prev_after)
+        prev_after = f.getSpaceAfter() or 0
+    return total
 
 
 def sanitize_text(text: str) -> str:
@@ -165,10 +211,11 @@ class PDFResumeBuilder:
 
         self.story.append(Paragraph(contact_html, self.contact_style))
 
-    def render_section_header(self, title: str):
+    def render_section_header(self, title: str, story: Optional[List] = None):
         title_clean = sanitize_text(title).upper()
-        self.story.append(Paragraph(f"<b>{title_clean}</b>", self.sec_title_style))
-        self.story.append(HRFlowable(width="100%", thickness=0.5, color=colors.black, spaceBefore=0.5, spaceAfter=2.5))
+        sink = story if story is not None else self.story
+        sink.append(Paragraph(f"<b>{title_clean}</b>", self.sec_title_style))
+        sink.append(HRFlowable(width="100%", thickness=0.5, color=colors.black, spaceBefore=0.5, spaceAfter=2.5))
 
     def render_summary(self, summary_text: str):
         if not summary_text:
@@ -242,7 +289,9 @@ class PDFResumeBuilder:
         bullets: List[str],
         date_str: str = "2026",
         github_url: Optional[str] = None,
+        story: Optional[List] = None,
     ):
+        sink = story if story is not None else self.story
         title_clean = sanitize_text(title)
         date_clean = sanitize_text(date_str)
 
@@ -265,17 +314,17 @@ class PDFResumeBuilder:
             ('LEFTPADDING', (0,0), (-1,-1), 0),
             ('RIGHTPADDING', (0,0), (-1,-1), 0),
         ]))
-        self.story.append(pt)
+        sink.append(pt)
 
         if tech_stack:
             tech_str = ", ".join(sanitize_text(t) for t in tech_stack)
-            self.story.append(Paragraph(f"<i>{tech_str}</i>", self.body_style))
+            sink.append(Paragraph(f"<i>{tech_str}</i>", self.body_style))
 
         for b in bullets:
             bullet_clean = sanitize_text(b).lstrip("*-? ").strip()
-            self.story.append(Paragraph(f"&bull; {bullet_clean}", self.bullet_style))
+            sink.append(Paragraph(f"&bull; {bullet_clean}", self.bullet_style))
 
-        self.story.append(Spacer(1, 1.5))
+        sink.append(Spacer(1, 1.5))
 
     def render_research_experience(
         self,
@@ -283,7 +332,9 @@ class PDFResumeBuilder:
         organization: str,
         date_range: str,
         bullets: List[str],
+        story: Optional[List] = None,
     ):
+        sink = story if story is not None else self.story
         t_clean = sanitize_text(title)
         org_clean = sanitize_text(organization)
         dates_clean = sanitize_text(date_range)
@@ -305,18 +356,19 @@ class PDFResumeBuilder:
             ('LEFTPADDING', (0,0), (-1,-1), 0),
             ('RIGHTPADDING', (0,0), (-1,-1), 0),
         ]))
-        self.story.append(rt)
+        sink.append(rt)
 
         for b in bullets:
             bullet_clean = sanitize_text(b).lstrip("*-? ").strip()
-            self.story.append(Paragraph(f"&bull; {bullet_clean}", self.bullet_style))
+            sink.append(Paragraph(f"&bull; {bullet_clean}", self.bullet_style))
 
-        self.story.append(Spacer(1, 2.5))
+        sink.append(Spacer(1, 2.5))
 
-    def render_achievements(self, achievements: List[str]):
+    def render_achievements(self, achievements: List[str], story: Optional[List] = None):
+        sink = story if story is not None else self.story
         for ach in achievements:
             ach_clean = sanitize_text(ach).lstrip("*-? ").strip()
-            self.story.append(Paragraph(f"&bull; {ach_clean}", self.bullet_style))
+            sink.append(Paragraph(f"&bull; {ach_clean}", self.bullet_style))
 
     def compile_pdf_bytes(self) -> bytes:
         buf = io.BytesIO()
@@ -387,7 +439,7 @@ def generate_resume_pdf(
         concepts=tailored_llm.core_concepts,
     )
 
-    # 5. Projects with Clickable GitHub URLs and Calibrated Depth
+    # 5. Projects with Clickable GitHub URLs and measured single-page space filling
     builder.render_section_header("Projects")
     profile_projects_map = {
         p.title.lower(): p for p in profile.verified_projects
@@ -398,53 +450,138 @@ def generate_resume_pdf(
     if not tailored_projects:
         tailored_projects = profile.verified_projects[:3]
 
-    for idx, tp in enumerate(tailored_projects):
-        title = tp.title
-        tech = getattr(tp, "tech_stack", [])
-        bullets = getattr(tp, "bullet_points", [])
+    primary_projects = [p for p in tailored_projects if not getattr(p, "is_filler", False)]
+    filler_projects = [p for p in tailored_projects if getattr(p, "is_filler", False)][: _MAX_FILLER_CANDIDATES]
+    if not primary_projects and filler_projects:
+        primary_projects = filler_projects[:3]
+        filler_projects = []
 
-        # Find matching master project for authentic date range and github URL
-        matched_orig = None
-        for k, v in profile_projects_map.items():
-            if k in title.lower() or title.lower() in k:
-                matched_orig = v
-                break
+    usable_w, usable_h = usable_frame_geometry(builder)
+    bottom_floor = _BOTTOM_BREATHING_ROOM_IN * 72.0
 
-        gh_url = getattr(tp, "github_url", None) or (matched_orig.github_url if matched_orig else None)
-        date_str = (matched_orig.date_range if matched_orig and hasattr(matched_orig, "date_range") and matched_orig.date_range else "2026")
+    est_prefix = estimate_story_height(builder.story, usable_w)
 
-        if not bullets and matched_orig and hasattr(matched_orig, "bullet_points") and matched_orig.bullet_points:
-            bullets = matched_orig.bullet_points
-
-        # Dynamic depth: Top projects get 2 bullets; secondary get 1 bullet to maintain single-page density
-        max_bullets = 2 if idx < 2 else 1
-        active_bullets = bullets[:max_bullets] if bullets else [getattr(tp, "description", title)]
-
-        builder.render_project(
-            title=title,
-            tech_stack=tech,
-            bullets=active_bullets,
-            date_str=date_str,
-            github_url=gh_url,
-        )
-
-    # 6. Research Experience (Samsung PRISM)
+    # Reserved tail sections (Research + Achievements) are measured off-line first so
+    # filler placement can never push them onto a second page
+    tail_story: List = []
     research_list = getattr(profile, "research_experience", [])
     if research_list:
-        builder.render_section_header("Research Experience")
+        builder.render_section_header("Research Experience", story=tail_story)
         for rx in research_list:
-            rx_bullets = rx.get("bullet_points", [])[:2] # Top 2 bullets for tight single page fit
+            rx_bullets = rx.get("bullet_points", [])[:2]  # Top 2 bullets for tight single-page fit
             builder.render_research_experience(
                 title=rx.get("title", "Research Worklet"),
                 organization=rx.get("organization", "VIT"),
                 date_range=rx.get("date_range", "2026 - Present"),
                 bullets=rx_bullets,
+                story=tail_story,
             )
-
-    # 7. Achievements & Certifications
     achievements = getattr(profile, "achievements", [])
     if achievements:
-        builder.render_section_header("Achievements & Certifications")
-        builder.render_achievements(achievements[:3])
+        builder.render_section_header("Achievements & Certifications", story=tail_story)
+        builder.render_achievements(achievements[:3], story=tail_story)
+    tail_h = estimate_story_height(tail_story, usable_w)
+
+    def _resolve_orig(tp):
+        """Match a tailored project to its master knowledge-base entry for authentic URL/date."""
+        matched_orig = None
+        for k, v in profile_projects_map.items():
+            if k in tp.title.lower() or tp.title.lower() in k:
+                matched_orig = v
+                break
+        gh_url = getattr(tp, "github_url", None) or (matched_orig.github_url if matched_orig else None)
+        date_str = (
+            matched_orig.date_range
+            if matched_orig and hasattr(matched_orig, "date_range") and matched_orig.date_range
+            else "2026"
+        )
+        tech = getattr(tp, "tech_stack", [])
+        bullets = getattr(tp, "bullet_points", [])
+        if not bullets and matched_orig and hasattr(matched_orig, "bullet_points") and matched_orig.bullet_points:
+            bullets = matched_orig.bullet_points
+        if not bullets:
+            bullets = [getattr(tp, "description", tp.title)]
+        return tech, list(bullets), date_str, gh_url
+
+    def _measure_project(title, tech, bullets, date_str, gh_url, cap: int) -> List:
+        """Flowables for one project rendered at the given bullet cap (height-measured)."""
+        flows: List = []
+        builder.render_project(
+            title=title,
+            tech_stack=tech,
+            bullets=bullets[:cap],
+            date_str=date_str,
+            github_url=gh_url,
+            story=flows,
+        )
+        return flows
+
+    def _bullet_est(text: str) -> float:
+        bullet_clean = sanitize_text(text).lstrip("*-? ").strip()
+        para = Paragraph(f"&bull; {bullet_clean}", builder.bullet_style)
+        _w, h = para.wrap(usable_w, _MAX_WRAP_HEIGHT)
+        return h + max(builder.bullet_style.spaceBefore or 0, builder.bullet_style.spaceAfter or 0)
+
+    resolved_primary = [(p, *_resolve_orig(p)) for p in primary_projects]
+
+    room_hard = usable_h - tail_h - est_prefix
+    fill_budget = usable_h - bottom_floor - tail_h - est_prefix
+
+    # Phase 1 (mandatory): base depth per original calibration; trim if page is dense
+    caps: List[int] = []
+    est_primary_total = 0.0
+    for idx, (tp, tech, bullets, date_str, gh_url) in enumerate(resolved_primary):
+        base_cap = min(2, len(bullets)) if idx < 2 else min(1, len(bullets))
+        cap = base_cap
+        est_proj = estimate_story_height(_measure_project(tp.title, tech, bullets, date_str, gh_url, cap), usable_w)
+        est_all = est_primary_total + est_proj
+        while est_all > room_hard and cap > 1:
+            cap -= 1
+            est_proj = estimate_story_height(_measure_project(tp.title, tech, bullets, date_str, gh_url, cap), usable_w)
+            est_all = est_primary_total + est_proj
+        caps.append(cap)
+        est_primary_total += est_proj
+
+    # Phase 2 (depth-first fill): restore extra bullets for the most relevant projects
+    fill_left = fill_budget - est_primary_total
+    for idx, (tp, tech, bullets, date_str, gh_url) in enumerate(resolved_primary):
+        while caps[idx] < len(bullets):
+            est_bullet = _bullet_est(bullets[caps[idx]])
+            if est_bullet > fill_left:
+                break
+            fill_left -= est_bullet
+            caps[idx] += 1
+
+    # Phase 3 (breadth fill): ranked filler candidates, one bullet each, while space allows
+    included_filler_flows: List[List] = []
+    for fp in filler_projects:
+        fp_tech, fp_bullets, fp_date, fp_gh = _resolve_orig(fp)
+        fp_flows = _measure_project(fp.title, fp_tech, fp_bullets, fp_date, fp_gh, min(1, len(fp_bullets)))
+        est_filler = estimate_story_height(fp_flows, usable_w)
+        if est_filler > fill_left:
+            break
+        fill_left -= est_filler
+        included_filler_flows.append(fp_flows)
+
+    # Final render straight from the measured decisions
+    for idx, (tp, tech, bullets, date_str, gh_url) in enumerate(resolved_primary):
+        builder.story.extend(_measure_project(tp.title, tech, bullets, date_str, gh_url, caps[idx]))
+    for flows in included_filler_flows:
+        builder.story.extend(flows)
+
+    # 6/7. Reserved tail sections (Research Experience + Achievements), appended untouched
+    builder.story.extend(tail_story)
+
+    _LAST_FIT_STATS.clear()
+    _LAST_FIT_STATS.update(
+        page_budget=usable_h - bottom_floor,
+        usable_h=usable_h,
+        est_prefix=est_prefix,
+        tail_h=tail_h,
+        est_primary_total=est_primary_total,
+        fillers_included=len(included_filler_flows),
+        fill_left=fill_left,
+        estimated_total=estimate_story_height(builder.story, usable_w),
+    )
 
     return builder.save_to_file(output_path)

@@ -315,9 +315,11 @@ def cmd_extract_image(args):
 
 def cmd_tailor_resume(args):
     """Tailor an ATS-optimized PDF resume for a job posting."""
+    from pathlib import Path
+
     from src.database import get_job_by_id
     from src.services.profile import get_candidate_profile
-    from src.services.resume import tailor_resume_for_job
+    from src.services.resume import compute_resume_base_name, rebuild_tailored_resume, tailor_resume_for_job
 
     job_id = args.job_id
     with get_session() as session:
@@ -327,9 +329,26 @@ def cmd_tailor_resume(args):
             sys.exit(1)
 
         profile = get_candidate_profile()
-        print(f"[*] Tailoring ATS resume for Job #{job_id} ({job.company_name} - {job.role_title})...")
+
+        rebuild_arg = None
+        if getattr(args, "no_fillers", False):
+            rebuild_arg = []
+        elif getattr(args, "keep_fillers", None):
+            rebuild_arg = [int(x) for x in str(args.keep_fillers).split(",") if x.strip().isdigit()]
+
         try:
-            res = tailor_resume_for_job(profile, job)
+            if rebuild_arg is not None:
+                payload_path = Path("resumes") / f"{compute_resume_base_name(job)}_payload.json"
+                res = rebuild_tailored_resume(profile, job, payload_path, keep_fillers=rebuild_arg)
+            else:
+                print(f"[*] Tailoring ATS resume for Job #{job_id} ({job.company_name} - {job.role_title})...")
+                res = tailor_resume_for_job(profile, job)
+            if res.generated_filler_titles:
+                print("[FILLER CANDIDATES]")
+                for i, title in enumerate(res.generated_filler_titles, start=1):
+                    print(f"    {i}. {title}")
+                print("    Re-fit page space with: python -m src.interfaces.cli tailor "
+                      f"{job_id} --keep-fillers 1,3   (or --no-fillers)")
             print("[+] Successfully generated ATS Resume!")
             print(f"    - Clean ATS PDF:    {res.pdf_file_path}")
             print(f"    - Markdown Copy:    {res.md_file_path}")
@@ -526,6 +545,10 @@ def main():
     # tailor
     tailor_parser = subparsers.add_parser("tailor", help="Tailor an ATS-optimized PDF resume for a job")
     tailor_parser.add_argument("job_id", type=int, help="Target job record ID from database")
+    tailor_parser.add_argument("--keep-fillers", type=str, default=None, metavar="1,3",
+                               help="Re-fit from cached payload keeping filler ranks 1-3")
+    tailor_parser.add_argument("--no-fillers", action="store_true",
+                               help="Re-fit from cached payload with all filler projects dropped")
 
     # run-bot
     subparsers.add_parser("run-bot", help="Start the Telegram Bot long-polling daemon")
