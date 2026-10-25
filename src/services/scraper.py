@@ -43,6 +43,18 @@ JS_HEAVY_ATS_DOMAINS = ("myworkdayjobs.com",)
 # Resource types skipped during browser rendering to keep it fast and cheap.
 _PW_BLOCKED_RESOURCES = frozenset({"image", "media", "font"})
 
+# Selectors that SPA career apps (Workday et al.) fill in after hydration.
+# networkidle is unreliable on these pages because analytics keep the network
+# busy, so waiting for content nodes is the correct settle strategy.
+_JS_CONTENT_SELECTORS = (
+    '[data-automation-id="jobDescription"]',
+    '[data-automation-id="jobDescriptionSection"]',
+    '[data-automation-id="richText"]',
+    'main',
+    'article',
+    '[role="main"]',
+)
+
 # HTTP statuses that usually indicate a bot challenge worth retrying in a real browser.
 _BOT_BLOCK_STATUSES = frozenset({401, 403, 429, 503})
 
@@ -133,6 +145,16 @@ def _playwright_fetch(url: str, timeout: float = 12.0) -> Optional[ScrapeResult]
                 page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
                 try:
                     page.wait_for_load_state("networkidle", timeout=4000)
+                except Exception:
+                    pass
+                for selector in _JS_CONTENT_SELECTORS:
+                    try:
+                        page.locator(selector).first.wait_for(state="visible", timeout=1500)
+                        break
+                    except Exception:
+                        continue
+                try:
+                    page.wait_for_timeout(400)
                 except Exception:
                     pass
                 html_content = page.content()
