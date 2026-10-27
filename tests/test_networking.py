@@ -80,6 +80,45 @@ def make_job(session: Session, company="Google", role="SWE Intern") -> JobPostin
 
 
 # ==============================================================================
+# Deterministic send guardrails (approval token + kill-switch)
+# ==============================================================================
+
+def test_send_blocked_without_approval_token(session: Session, monkeypatch):
+    _gmail_env(monkeypatch)
+    from src.services.outreach import send_outreach_email
+    make_contact(session)
+    before = len(FakeSMTP.instances)
+    with pytest.raises(OutreachError, match="SEND BLOCKED"):
+        send_outreach_email("sarah@google.com", "s", "b", smtp_factory=FakeSMTP)
+    assert len(FakeSMTP.instances) == before  # no SMTP session was ever created
+
+
+def test_send_blocked_with_wrong_token(session: Session, monkeypatch):
+    _gmail_env(monkeypatch)
+    from src.services.outreach import send_outreach_email
+    with pytest.raises(OutreachError, match="SEND BLOCKED"):
+        send_outreach_email("sarah@google.com", "s", "b", smtp_factory=FakeSMTP, approval_token="guessed")
+    with pytest.raises(OutreachError, match="SEND BLOCKED"):
+        send_outreach_email("sarah@google.com", "s", "b", smtp_factory=FakeSMTP, approval_token="")
+
+
+def test_send_blocked_by_kill_switch(session: Session, monkeypatch):
+    _gmail_env(monkeypatch)
+    monkeypatch.setattr(settings, "OUTREACH_SEND_ENABLED", False)
+    from src.services.outreach import SEND_APPROVAL_TOKEN, send_outreach_email
+    with pytest.raises(OutreachError, match="kill-switch"):
+        send_outreach_email("sarah@google.com", "s", "b", smtp_factory=FakeSMTP, approval_token=SEND_APPROVAL_TOKEN)
+
+
+def test_approved_path_successfully_passes_gate(session: Session, monkeypatch):
+    """approve_and_send (the human-approval path) is the ONLY caller that clears the gate."""
+    _gmail_env(monkeypatch)
+    contact = make_contact(session)
+    updated = approve_and_send(session, contact.id, "s", "b", smtp_factory=FakeSMTP)
+    assert updated.outreach_status == OutreachStatus.SENT
+
+
+# ==============================================================================
 # Contact book (upsert / dedupe)
 # ==============================================================================
 

@@ -39,6 +39,12 @@ SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 CAP_LEDGER_KEY = "cap_ledger"
 
+# Deterministic send gate: SMTP delivery is IMPOSSIBLE unless a caller passes
+# this module-level token. Only approve_and_send() (the Telegram Approve-button
+# path) forwards it. Direct calls must pass the token explicitly, which makes
+# every send site in the codebase auditable by grep.
+SEND_APPROVAL_TOKEN = "user-approved-send"
+
 
 class OutreachError(RuntimeError):
     """Delivery-side failure (missing credentials, SMTP error, cap reached)."""
@@ -70,8 +76,25 @@ def send_outreach_email(
     subject: str,
     body: str,
     smtp_factory=None,
+    approval_token: Optional[str] = None,
 ) -> datetime:
-    """Send one approved email through Gmail SMTP; returns the sent timestamp."""
+    """Send one approved email through Gmail SMTP; returns the sent timestamp.
+
+    DETERMINISTIC GUARDRAILS (checked before any network I/O):
+    1. approval_token must equal SEND_APPROVAL_TOKEN — only the Telegram
+       Approve-button path (approve_and_send) passes it, so nothing can ever
+       send without an explicit human click.
+    2. settings.OUTREACH_SEND_ENABLED is a master kill-switch; when false,
+       even approved sends are physically blocked.
+    """
+    if approval_token != SEND_APPROVAL_TOKEN:
+        raise OutreachError(
+            "SEND BLOCKED: email delivery requires explicit user approval. "
+            "Only the Telegram /draft -> Approve path may send (approval_token=SEND_APPROVAL_TOKEN)."
+        )
+    if not settings.OUTREACH_SEND_ENABLED:
+        raise OutreachError("SEND BLOCKED: OUTREACH_SEND_ENABLED=false (master kill-switch in .env).")
+
     user, password = _email_credentials()
     safe_to = parseaddr(to_address)[1] or to_address
     msg = MIMEText(body, "plain", "utf-8")
@@ -270,7 +293,9 @@ def approve_and_send(
     if has_scheduler_event(session, event_type, str(contact.id), today):
         raise OutreachError("This contact was already emailed today; use /draft tomorrow for the follow-up.")
 
-    sent_at = send_outreach_email(contact.email, subject, body, smtp_factory=smtp_factory)
+    sent_at = send_outreach_email(
+        contact.email, subject, body, smtp_factory=smtp_factory, approval_token=SEND_APPROVAL_TOKEN
+    )
 
     contact.updated_at = get_utc_now()
     contact.outreach_status = (

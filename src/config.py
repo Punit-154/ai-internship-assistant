@@ -116,6 +116,10 @@ class Settings(BaseSettings):
     )
 
     # Outreach rate caps (spam-safety design)
+    OUTREACH_SEND_ENABLED: bool = Field(
+        default=True,
+        description="Master kill-switch: set false to block ALL outbound email sends, even approved ones"
+    )
     OUTREACH_MAX_FIRST_SENDS_PER_DAY: int = Field(
         default=20,
         description="Maximum first-contact cold emails approved per day"
