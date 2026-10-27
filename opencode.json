@@ -1,11 +1,16 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "permission": {
-    "read":   { "**/.env*": "deny", "**\\\\.env*": "deny" },
-    "edit":   { "**/.env*": "deny", "**\\\\.env*": "deny" },
-    "grep":   { "**/.env*": "deny", "**\\\\.env*": "deny" },
-    "glob":   { "**/.env*": "deny", "**\\\\.env*": "deny" },
-    "list":   { "**/.env*": "deny", "**\\\\.env*": "deny" },
-    "bash":   { "*.env*": "deny" }
-  }
+  "permissions": [
+    { "action": "read", "resource": "**/.env*", "effect": "deny" },
+    { "action": "edit", "resource": "**/.env*", "effect": "deny" },
+    { "action": "grep", "resource": "**/.env*", "effect": "deny" },
+    { "action": "glob", "resource": "**/.env*", "effect": "deny" },
+    { "action": "list", "resource": "**/.env*", "effect": "deny" },
+    { "action": "bash", "resource": "*.env*", "effect": "deny" },
+    { "action": "read", "resource": "**\\.env*", "effect": "deny" },
+    { "action": "edit", "resource": "**\\.env*", "effect": "deny" },
+    { "action": "grep", "resource": "**\\.env*", "effect": "deny" },
+    { "action": "glob", "resource": "**\\.env*", "effect": "deny" },
+    { "action": "list", "resource": "**\\.env*", "effect": "deny" }
+  ]
 }
