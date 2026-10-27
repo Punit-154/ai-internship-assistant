@@ -3,9 +3,12 @@
 from src.services.alumni_finder import AlumniFinderError, find_engineers_on_github
 from src.services.contact_enrichment import (
     EnrichedContact,
+    ProspeoAccount,
     ProspeoError,
     enrich_linkedin_profile,
     enrichment_available,
+    enrichment_enabled,
+    get_prospeo_account,
     validate_prospero_api_key,
 )
 from src.services.extractor import (

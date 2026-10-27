@@ -338,6 +338,36 @@ def log_scheduler_event(
         session.commit()
 
 
+def add_scheduler_event(
+    session: Session,
+    event_type: SchedulerEventType,
+    event_key: str,
+    detail: Optional[str] = None,
+    ref_date: Optional[date] = None,
+) -> None:
+    """Insert a ledger row WITHOUT the one-shot-per-key-date dedupe gate.
+
+    Use for counters (e.g. the Prospeo enrichment budget) where every attempt
+    is a distinct, countable event.
+    """
+    session.add(SchedulerLog(
+        event_type=event_type,
+        event_key=event_key,
+        sent_date=ref_date or today_local(),
+        detail=detail,
+    ))
+    session.commit()
+
+
+def count_scheduler_events_since(session: Session, event_type: SchedulerEventType, since: datetime) -> int:
+    """Count ledger events of a type within a rolling window (rate-limit budgets)."""
+    stmt = select(SchedulerLog).where(
+        SchedulerLog.event_type == event_type,
+        SchedulerLog.created_at >= since,
+    )
+    return len(list(session.exec(stmt).all()))
+
+
 # ==============================================================================
 # Deadline Reminder Sweep
 # ==============================================================================

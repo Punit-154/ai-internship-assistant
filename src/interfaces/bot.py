@@ -37,12 +37,15 @@ from telegram.request import HTTPXRequest
 
 from src.config import settings
 from src.database import (
+    add_scheduler_event,
     add_watch_target,
+    count_scheduler_events_since,
     deactivate_watch_target,
     get_job_by_id,
     get_jobs_needing_deadline_reminder,
     get_session,
     get_upcoming_deadlines,
+    get_utc_now,
     has_scheduler_event,
     init_db,
     list_jobs,
@@ -61,9 +64,13 @@ from src.models.job import (
 from src.models.system import SchedulerEventType, WatchTargetType
 from src.services.alumni_finder import AlumniFinderError, build_linkedin_search_urls, find_engineers_on_github
 from src.services.contact_enrichment import (
+    CODE_NO_MATCH,
+    CODE_RATE_LIMITED,
     ProspeoError,
     enrich_linkedin_profile,
     enrichment_available,
+    enrichment_enabled,
+    get_prospeo_account,
 )
 from src.services.digest import (
     build_daily_digest,
@@ -278,6 +285,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/contacts [github &lt;company&gt;] - List contacts / run alumni visibility sweep\n"
         "/draft &lt;contact_id&gt; [job_id] - Draft an approval-gated cold intro email\n"
         "/replied &lt;contact_id&gt; - Mark that this contact replied\n"
+        "/prospeo - Prospeo credits & enrichment rate-budget status\n"
         "/help - Show this guidance message\n\n"
         f"<i>Auto-scheduled:</i> 🌅 digest at {settings.DIGEST_HOUR_LOCAL:02d}:00 local"
         f" every day, ⏰ deadline reminders every {settings.DEADLINE_CHECK_INTERVAL_HOURS}h,"
@@ -1107,12 +1115,35 @@ def _sync_latest_job_id(session) -> Optional[int]:
     return row if row else None
 
 
+def _prospeo_daily_budget(session) -> Tuple[int, int]:
+    """(attempts in the rolling 24h window, configured cap) for Prospeo enrichment."""
+    used = count_scheduler_events_since(
+        session,
+        SchedulerEventType.PROSPEO_ENRICH_REQUEST,
+        since=get_utc_now() - timedelta(hours=24),
+    )
+    return used, settings.PROSPEO_MAX_ENRICH_PER_DAY
+
+
+def _record_enrich_attempt(session, event_key: str, outcome: str) -> None:
+    """Log one enrichment attempt (any outcome) toward the daily rate budget."""
+    add_scheduler_event(
+        session,
+        SchedulerEventType.PROSPEO_ENRICH_REQUEST,
+        event_key[:190],
+        detail=outcome[:120],
+    )
+
+
 @requires_authorization
 async def cmd_addcontact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /addcontact <email-or-linkedin> [| Full Name [| Company [| Role [| relationship]]]]."""
     raw = " ".join(context.args or []).strip()
     if not raw:
-        enrich_state = "ON (Prospeo)" if enrichment_available() else "OFF (set PROSPEO_API_KEY in .env)"
+        if not enrichment_enabled():
+            enrich_state = "DISABLED (PROSPEO_ENRICH_ENABLED=false)"
+        else:
+            enrich_state = "ON (Prospeo)" if enrichment_available() else "OFF (set PROSPEO_API_KEY in .env)"
         await update.message.reply_text(
             "🤝 <b>Add a networking contact</b>\n\n"
             "<b>Usage:</b>\n"
@@ -1135,18 +1166,92 @@ async def cmd_addcontact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if "linkedin.com/in/" in identifier:
         if not enrichment_available():
             await update.message.reply_text(
-                "❌ LinkedIn lookup needs <code>PROSPEO_API_KEY</code> in .env (Starter plan gives API access).\n"
+                "❌ LinkedIn lookup needs <code>PROSPEO_API_KEY</code> in .env (free account at "
+                "app.prospeo.io → API Keys → copy).\n"
                 "💡 Until then add contacts by email: <code>/addcontact jane@company.com | Jane | ...</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
-        status_msg = await update.message.reply_text("🛰️ <i>Enriching profile via Prospeo (1 credit)...</i>", parse_mode=ParseMode.HTML)
+        if not enrichment_enabled():
+            await update.message.reply_text(
+                "🔒 Prospeo enrichment is disabled (<code>PROSPEO_ENRICH_ENABLED=false</code> in .env).\n"
+                "💡 Add contacts by email instead: <code>/addcontact jane@company.com | Jane | ...</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        with get_session() as session:
+            existing = session.exec(select(Contact).where(Contact.linkedin_url == identifier)).first()
+            if existing and existing.email:
+                await update.message.reply_text(
+                    f"ℹ️ Contact <b>#{existing.id}</b> already has an email on file — no Prospeo call made.\n"
+                    + _format_contact_line(existing)
+                    + f"\n\n<i>Draft an intro:</i> <code>/draft {existing.id}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            used, cap = _prospeo_daily_budget(session)
+        if used >= cap:
+            await update.message.reply_text(
+                f"💳 <b>Enrichment budget reached</b> ({used}/{cap} attempts in the last 24h).\n"
+                "Free plan guidance: ~3/day keeps you inside 100 credits/month.\n"
+                "Swap in a fresh <code>PROSPEO_API_KEY</code>, raise <code>PROSPEO_MAX_ENRICH_PER_DAY</code> in .env, "
+                "or try again tomorrow.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        status_msg = await update.message.reply_text(
+            "🛰️ <i>Enriching profile via Prospeo (verified emails only, 1 credit)...</i>",
+            parse_mode=ParseMode.HTML,
+        )
         try:
-            enriched = await asyncio.to_thread(enrich_linkedin_profile, identifier)
+            enriched = await asyncio.to_thread(
+                enrich_linkedin_profile,
+                identifier,
+                full_name=full_name,
+                company_name=company_name,
+            )
         except ProspeoError as exc:
+            with get_session() as session:
+                _record_enrich_attempt(session, identifier, outcome=f"err:{exc.code}")
+            if exc.code == CODE_NO_MATCH:
+                # Free outcome: save the contact anyway so the profile is not lost.
+                with get_session() as session:
+                    contact, created = upsert_contact(
+                        session,
+                        full_name=full_name or identifier,
+                        company_name=company_name,
+                        role_title=role_title,
+                        relationship=relationship,
+                        email=None,
+                        linkedin_url=identifier,
+                        source="prospeo",
+                        email_status="unverified",
+                    )
+                await status_msg.edit_text(
+                    "🔎 <b>No verified email found</b> for this profile (0 credits charged).\n"
+                    f"✅ Contact {'saved' if created else 'updated'} anyway: <b>#{contact.id}</b>\n"
+                    + _format_contact_line(contact)
+                    + "\n\n<i>Attach an email later with:</i> "
+                    "<code>/addcontact jane@company.com | Jane Doe | Company</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+            elif exc.code == CODE_RATE_LIMITED:
+                await status_msg.edit_text(
+                    f"⏳ {html.escape(str(exc))}\n\n<i>Check your budget with /prospeo.</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await status_msg.edit_text(
+                    f"❌ <b>Enrichment failed:</b>\n<i>{html.escape(str(exc))}</i>\n\n"
+                    "Try adding by email instead: <code>/addcontact jane@company.com | Jane</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+        except ValueError as exc:
             await status_msg.edit_text(
-                f"❌ <b>Enrichment failed:</b>\n<i>{html.escape(str(exc))}</i>\n\n"
-                "Try adding by email instead: <code>/addcontact jane@company.com | Jane</code>",
+                f"❌ <b>Lookup refused:</b>\n<i>{html.escape(str(exc))}</i>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1158,15 +1263,20 @@ async def cmd_addcontact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 company_name=enriched.company_name or company_name,
                 role_title=enriched.role_title or role_title,
                 relationship=relationship,
-                email=enriched.email or None,
+                email=enriched.email,
                 linkedin_url=identifier,
                 source="prospeo",
-                email_status="prospeo_verified" if enriched.email else "unverified",
+                email_status="prospeo_verified",
             )
+            _record_enrich_attempt(session, identifier, outcome="ok_free" if enriched.free_enrichment else "ok")
+        credit_line = "💳 0 credits (free 90-day repeat)" if enriched.free_enrichment else "💳 1 credit charged"
+        if enriched.daily_requests_left is not None:
+            credit_line += f" | {enriched.daily_requests_left} enrich requests left today"
         await status_msg.edit_text(
             f"✅ <b>Contact {'saved' if created else 'updated'}: {html.escape(contact.full_name)}</b>\n"
-            f"📧 {html.escape(contact.email or '(no email found)')} | 🏢 {html.escape(contact.company_name or '—')}\n"
-            f"💼 {html.escape(contact.role_title or '—')}\n\n"
+            f"📧 <code>{html.escape(contact.email)}</code> | 🏢 {html.escape(contact.company_name or '—')}\n"
+            f"💼 {html.escape(contact.role_title or '—')}\n"
+            f"{credit_line}\n\n"
             "<i>Draft an intro:</i> <code>/draft " + str(contact.id) + "</code>",
             parse_mode=ParseMode.HTML,
         )
@@ -1326,6 +1436,48 @@ async def cmd_replied(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     else:
         await update.message.reply_text(f"❌ Contact #{args[0]} not found.")
+
+
+@requires_authorization
+async def cmd_prospeo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /prospeo — enrichment telemetry: plan, credits, renewal, rate budget."""
+    if not enrichment_available():
+        await update.message.reply_text(
+            "❌ <code>PROSPEO_API_KEY</code> is not configured in .env.\n"
+            "Free account: app.prospeo.io → API Keys → paste into .env → restart the bot.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not enrichment_enabled():
+        await update.message.reply_text(
+            "🔒 Enrichment is disabled (<code>PROSPEO_ENRICH_ENABLED=false</code> in .env).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    status_msg = await update.message.reply_text("📊 <i>Checking Prospeo account...</i>", parse_mode=ParseMode.HTML)
+    try:
+        account = await asyncio.to_thread(get_prospeo_account)
+    except ProspeoError as exc:
+        await status_msg.edit_text(
+            f"❌ <b>Prospeo status failed:</b>\n<i>{html.escape(str(exc))}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    with get_session() as session:
+        used, cap = _prospeo_daily_budget(session)
+    remaining = account.remaining_credits if account.remaining_credits is not None else "?"
+    used_credits = account.used_credits if account.used_credits is not None else "?"
+    renew = f"in ~{account.next_quota_renewal_days} days" if account.next_quota_renewal_days is not None else "soon"
+    await status_msg.edit_text(
+        "🛰️ <b>Prospeo Enrichment Status</b>\n"
+        f"🏆 Plan: <b>{html.escape(account.current_plan)}</b>\n"
+        f"💳 Credits: <b>{remaining}</b> remaining ({used_credits} used this cycle)\n"
+        f"📅 Quota renews {renew}\n"
+        f"📈 Enrich attempts (24h): <b>{used}/{cap}</b>\n\n"
+        "<i>1 credit per verified email • NO_MATCH is free • re-enrich ≤90 days is free.</i>\n"
+        "<i>Credits exhausted? Swap PROSPEO_API_KEY in .env and restart the bot.</i>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @requires_authorization
@@ -1659,6 +1811,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("contacts", cmd_contacts))
     app.add_handler(CommandHandler("draft", cmd_draft))
     app.add_handler(CommandHandler("replied", cmd_replied))
+    app.add_handler(CommandHandler("prospeo", cmd_prospeo))
 
     # Inline Keyboard Button Clicks
     app.add_handler(CallbackQueryHandler(handle_callback_query))
@@ -1685,7 +1838,7 @@ def run_telegram_bot() -> None:
     print(f"[*] Whitelisted Telegram User ID: {whitelist_state}")
     print("[*] Resilient HTTP timeouts: 30s connect / 30s read")
     print("[*] Resume Tailoring enabled (/tailor <id>)")
-    print("[*] Approved cold-outreach enabled (/addcontact /contacts /draft /replied)")
+    print("[*] Approved cold-outreach enabled (/addcontact /contacts /draft /replied /prospeo)")
     print("[*] Background jobs: 8AM digest | deadline reminders | watchlist discovery | outreach follow-ups")
     print("    Manage boards with /watch | manual sweep with /discover")
     app = build_telegram_app()

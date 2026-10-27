@@ -22,6 +22,7 @@ class SchedulerEventType(str, Enum):
     DISCOVERY_RUN = "discovery_run"
     OUTREACH_FIRST_SEND = "outreach_first_send"
     OUTREACH_FOLLOWUP_SEND = "outreach_followup_send"
+    PROSPEO_ENRICH_REQUEST = "prospeo_enrich_request"
 
 
 class SchedulerLog(SQLModel, table=True):

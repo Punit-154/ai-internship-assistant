@@ -18,9 +18,19 @@ from src.services.alumni_finder import (
     find_engineers_on_github,
 )
 from src.services.contact_enrichment import (
+    CODE_BAD_RESPONSE,
+    CODE_INSUFFICIENT_CREDITS,
+    CODE_INVALID_API_KEY,
+    CODE_NETWORK,
+    CODE_NO_MATCH,
+    CODE_RATE_LIMITED,
     ProspeoError,
+    _reset_throttle_state,
+    _throttle,
     enrich_linkedin_profile,
     enrichment_available,
+    enrichment_enabled,
+    get_prospeo_account,
 )
 from src.services.outreach import (
     CAP_LEDGER_KEY,
@@ -167,6 +177,38 @@ def test_upsert_merge_does_not_downgrade_status(session: Session):
         session, full_name="Jane", email="jane@x.com", email_status=EmailStatus.PROSPEO_VERIFIED
     )
     assert prospeo.email_status == EmailStatus.PROSPEO_VERIFIED  # verification upgrade wins
+
+
+def test_upsert_name_company_fallback_dedupes_no_match_flow(session: Session):
+    # NO_MATCH flow: LinkedIn contact saved WITHOUT an email (source prospeo, unverified).
+    first, created = upsert_contact(
+        session,
+        full_name="Jane Doe",
+        company_name="Stripe",
+        linkedin_url="https://linkedin.com/in/janedoe",
+        source="prospeo",
+    )
+    assert created is True
+    assert first.email is None
+
+    # Later the user finds the email manually: merged, not duplicated.
+    second, created2 = upsert_contact(
+        session,
+        full_name="Jane Doe",
+        company_name="Stripe",
+        email="jane@stripe.com",
+        email_status=EmailStatus.PROSPEO_VERIFIED,
+    )
+    assert created2 is False
+    assert second.id == first.id
+    assert second.email == "jane@stripe.com"
+    assert second.email_status == EmailStatus.PROSPEO_VERIFIED
+
+
+def test_upsert_name_company_fallback_requires_both_fields(session: Session):
+    upsert_contact(session, full_name="Jane Doe", company_name="Stripe")
+    contact, created = upsert_contact(session, full_name="Jane Doe", email="janed@other.com")
+    assert created is True  # no company hint -> never merges on name alone
 
 
 # ==============================================================================
@@ -346,8 +388,31 @@ def test_craft_outreach_draft_llm_failure_falls_back(session: Session, monkeypat
 
 
 # ==============================================================================
-# Prospeo enrichment adapter
+# Prospeo enrichment adapter (Enrich-Person contract, docs June 2026)
 # ==============================================================================
+
+SUCCESS_BODY = {
+    "error": False,
+    "free_enrichment": False,
+    "person": {
+        "person_id": "aaaacd817619fba3",
+        "full_name": "Sarah K",
+        "current_job_title": "Tech Recruiter",
+        "linkedin_url": "https://www.linkedin.com/in/sarahk",
+        "email": {"status": "VERIFIED", "revealed": True, "email": "sarah.k@google.com"},
+    },
+    "company": {"name": "Google", "domain": "google.com"},
+}
+
+
+@pytest.fixture(autouse=True)
+def _no_prospeo_throttle(monkeypatch):
+    """Keep adapter tests fast: no real sleeping + a clean throttle clock per test."""
+    monkeypatch.setattr(settings, "PROSPEO_MIN_INTERVAL_SECONDS", 0.0)
+    _reset_throttle_state()
+    yield
+    _reset_throttle_state()
+
 
 def test_validate_prospero_api_key_rejects_empty(monkeypatch):
     monkeypatch.setattr(settings, "PROSPEO_API_KEY", "")
@@ -366,6 +431,7 @@ def test_validate_prospero_api_key_rejects_placeholder_and_short(monkeypatch):
 def test_enrichment_available_true_with_key(monkeypatch):
     monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
     assert enrichment_available() is True
+    assert enrichment_enabled() is True  # default kill-switch state
 
 
 def _prospeo_response(status, payload):
@@ -375,42 +441,128 @@ def _prospeo_response(status, payload):
     return response
 
 
-def test_enrich_linkedin_profile_success(monkeypatch):
+def test_enrich_linkedin_profile_success_and_request_shape(monkeypatch):
     monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
     fake = MagicMock()
-    fake.post.return_value = _prospeo_response(200, {"data": {"full_name": "Sarah K", "email": "sarah.k@google.com", "job_title": "Tech Recruiter", "company": "Google"}})
+    fake.post.return_value = _prospeo_response(200, SUCCESS_BODY)
 
     enriched = enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
     assert enriched.email == "sarah.k@google.com"
     assert enriched.full_name == "Sarah K"
+    assert enriched.role_title == "Tech Recruiter"
     assert enriched.company_name == "Google"
+    assert enriched.person_id == "aaaacd817619fba3"
     assert enriched.email_status == EmailStatus.PROSPEO_VERIFIED
+    assert enriched.credits_used == 1
+    assert enriched.free_enrichment is False
+
     args, kwargs = fake.post.call_args
-    assert "api.prospeo.io" in args[0]
+    assert args[0] == "https://api.prospeo.io/enrich-person"
+    assert kwargs["json"] == {
+        "only_verified_email": True,
+        "enrich_mobile": False,
+        "data": {"linkedin_url": "https://linkedin.com/in/sarahk"},
+    }
     assert kwargs["headers"]["X-KEY"] == "pk_live_9f8e7d6c5b4a3210"
 
 
-def test_enrich_linkedin_profile_error_code(monkeypatch):
+def test_enrich_payload_passes_name_company_hints(monkeypatch):
     monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
     fake = MagicMock()
-    fake.post.return_value = _prospeo_response(400, {"error_code": "API_KEY_INVALID"})
-    with pytest.raises(ProspeoError, match="rejected the API key"):
+    fake.post.return_value = _prospeo_response(200, SUCCESS_BODY)
+    enrich_linkedin_profile(
+        "https://linkedin.com/in/sarahk",
+        http_client=fake,
+        full_name="Sarah K",
+        company_name="Google",
+    )
+    assert fake.post.call_args.kwargs["json"]["data"] == {
+        "linkedin_url": "https://linkedin.com/in/sarahk",
+        "full_name": "Sarah K",
+        "company_name": "Google",
+    }
+
+
+def test_enrich_no_match_is_free(monkeypatch):
+    monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
+    fake = MagicMock()
+    fake.post.return_value = _prospeo_response(400, {"error": True, "error_code": "NO_MATCH"})
+    with pytest.raises(ProspeoError) as exc_info:
+        enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
+    assert exc_info.value.code == CODE_NO_MATCH
+    assert "0 credits" in str(exc_info.value)
+
+
+def test_enrich_insufficient_credits_message(monkeypatch):
+    monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
+    fake = MagicMock()
+    fake.post.return_value = _prospeo_response(400, {"error": True, "error_code": "INSUFFICIENT_CREDITS"})
+    with pytest.raises(ProspeoError) as exc_info:
+        enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
+    assert exc_info.value.code == CODE_INSUFFICIENT_CREDITS
+    assert ".env" in str(exc_info.value)  # tells the user how to swap the key
+
+
+def test_enrich_invalid_api_key_message(monkeypatch):
+    monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
+    fake = MagicMock()
+    fake.post.return_value = _prospeo_response(400, {"error": True, "error_code": "INVALID_API_KEY"})
+    with pytest.raises(ProspeoError) as exc_info:
+        enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
+    assert exc_info.value.code == CODE_INVALID_API_KEY
+    assert "PROSPEO_API_KEY" in str(exc_info.value)
+
+
+def test_enrich_rate_limited_uses_reset_headers(monkeypatch):
+    monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
+    resp = _prospeo_response(429, {"error_code": "Rate limit exceeded"})
+    resp.headers = {"x-daily-request-left": "42", "x-minute-reset-seconds": "30"}
+    fake = MagicMock()
+    fake.post.return_value = resp
+    with pytest.raises(ProspeoError) as exc_info:
+        enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
+    assert exc_info.value.code == CODE_RATE_LIMITED
+    assert "42" in str(exc_info.value)
+    assert "30" in str(exc_info.value)
+
+
+def test_enrich_free_repeat_within_90_days(monkeypatch):
+    monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
+    body = dict(SUCCESS_BODY, free_enrichment=True)
+    fake = MagicMock()
+    fake.post.return_value = _prospeo_response(200, body)
+    enriched = enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
+    assert enriched.free_enrichment is True
+    assert enriched.credits_used == 0
+
+
+def test_enrich_rejects_unverified_or_unrevealed_email(monkeypatch):
+    monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
+    body = dict(
+        SUCCESS_BODY,
+        person=dict(SUCCESS_BODY["person"], email={"status": "CATCH_ALL", "revealed": True, "email": "x@google.com"}),
+    )
+    fake = MagicMock()
+    fake.post.return_value = _prospeo_response(200, body)
+    with pytest.raises(ProspeoError, match="verified email"):
         enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
 
+    body2 = dict(
+        SUCCESS_BODY,
+        person=dict(SUCCESS_BODY["person"], email={"status": "VERIFIED", "revealed": False, "email": "x@google.com"}),
+    )
+    fake2 = MagicMock()
+    fake2.post.return_value = _prospeo_response(200, body2)
+    with pytest.raises(ProspeoError, match="verified email"):
+        enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake2)
 
-def test_enrich_linkedin_profile_generic_error(monkeypatch):
+
+def test_enrich_person_without_email_raises_no_match(monkeypatch):
     monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
+    body = {"error": False, "free_enrichment": False, "person": {"full_name": "Sarah K"}, "company": None}
     fake = MagicMock()
-    fake.post.return_value = _prospeo_response(400, {"error_code": "NO_RESULT"})
-    with pytest.raises(ProspeoError, match="NO_RESULT"):
-        enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
-
-
-def test_enrich_linkedin_profile_no_email(monkeypatch):
-    monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
-    fake = MagicMock()
-    fake.post.return_value = _prospeo_response(200, {"data": {"full_name": "Sarah K"}})
-    with pytest.raises(ProspeoError, match="no verified email"):
+    fake.post.return_value = _prospeo_response(200, body)
+    with pytest.raises(ProspeoError, match="verified email"):
         enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
 
 
@@ -419,7 +571,16 @@ def test_enrich_linkedin_profile_non_json(monkeypatch):
     fake = MagicMock()
     fake.post.return_value = _prospeo_response(502, {})
     fake.post.return_value.json.side_effect = ValueError("bad json")
-    with pytest.raises(ProspeoError, match="non-JSON"):
+    with pytest.raises(ProspeoError) as exc_info:
+        enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
+    assert exc_info.value.code == CODE_BAD_RESPONSE
+
+
+def test_enrich_unknown_error_code_still_reported(monkeypatch):
+    monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
+    fake = MagicMock()
+    fake.post.return_value = _prospeo_response(400, {"error": True, "error_code": "NO_RESULT"})
+    with pytest.raises(ProspeoError, match="NO_RESULT"):
         enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
 
 
@@ -432,8 +593,81 @@ def test_enrich_linkedin_profile_http_error(monkeypatch):
     monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
     fake = MagicMock()
     fake.post.side_effect = httpx.ConnectError("no network")
-    with pytest.raises(ProspeoError, match="request failed"):
+    with pytest.raises(ProspeoError) as exc_info:
         enrich_linkedin_profile("https://linkedin.com/in/sarahk", http_client=fake)
+    assert exc_info.value.code == CODE_NETWORK
+
+
+def test_get_prospeo_account_parses_snapshot(monkeypatch):
+    monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
+    fake = MagicMock()
+    fake.get.return_value = _prospeo_response(
+        200,
+        {
+            "error": False,
+            "response": {
+                "current_plan": "FREE",
+                "remaining_credits": 99,
+                "used_credits": 1,
+                "next_quota_renewal_days": 25,
+                "next_quota_renewal_date": "2026-11-21 20:52:28+00:00",
+            },
+        },
+    )
+    account = get_prospeo_account(http_client=fake)
+    assert account.current_plan == "FREE"
+    assert account.remaining_credits == 99
+    assert account.used_credits == 1
+    assert account.next_quota_renewal_days == 25
+    assert fake.get.call_args.args[0] == "https://api.prospeo.io/account-information"
+    assert fake.get.call_args.kwargs["headers"]["X-KEY"] == "pk_live_9f8e7d6c5b4a3210"
+
+
+def test_get_prospeo_account_invalid_key(monkeypatch):
+    monkeypatch.setattr(settings, "PROSPEO_API_KEY", "pk_live_9f8e7d6c5b4a3210")
+    fake = MagicMock()
+    fake.get.return_value = _prospeo_response(400, {"error": True, "error_code": "INVALID_API_KEY"})
+    with pytest.raises(ProspeoError) as exc_info:
+        get_prospeo_account(http_client=fake)
+    assert exc_info.value.code == CODE_INVALID_API_KEY
+
+
+def test_throttle_sleeps_between_calls(monkeypatch):
+    ticks = [0.0, 0.4, 1.05]
+    clock = MagicMock(side_effect=list(ticks))
+    sleeps = []
+    monkeypatch.setattr(settings, "PROSPEO_MIN_INTERVAL_SECONDS", 1.0)
+    _reset_throttle_state()
+    first = _throttle(clock=clock, sleeper=sleeps.append, min_interval=None)
+    assert first == 0.0
+    second = _throttle(clock=clock, sleeper=sleeps.append, min_interval=None)
+    assert sleeps == [0.6]
+    assert second == 0.6
+
+
+def test_throttle_bypassed_when_interval_zero():
+    clock = MagicMock(side_effect=[1.0, 1.0])
+    sleeps = []
+    waited1 = _throttle(clock=clock, sleeper=sleeps.append, min_interval=0.0)
+    waited2 = _throttle(clock=clock, sleeper=sleeps.append, min_interval=0.0)
+    assert (waited1, waited2) == (0.0, 0.0)
+    assert sleeps == []
+
+
+# ==============================================================================
+# Enrichment budget ledger (rolling 24h window over the scheduler log)
+# ==============================================================================
+
+def test_prospeo_daily_budget_counts_attempts(session: Session, monkeypatch):
+    monkeypatch.setattr(settings, "PROSPEO_MAX_ENRICH_PER_DAY", 2)
+    from src.interfaces.bot import _prospeo_daily_budget, _record_enrich_attempt
+
+    _record_enrich_attempt(session, "https://linkedin.com/in/a", outcome="ok")
+    used, cap = _prospeo_daily_budget(session)
+    assert (used, cap) == (1, 2)
+    _record_enrich_attempt(session, "https://linkedin.com/in/b", outcome="err:NO_MATCH")
+    used, _ = _prospeo_daily_budget(session)
+    assert used == 2  # failed attempts count too (conservative budget)
 
 
 # ==============================================================================

@@ -27,6 +27,7 @@ from src.database import (
     get_utc_now,
     has_scheduler_event,
     log_scheduler_event,
+    normalize_text_key,
     today_local,
 )
 from src.models.contact import Contact, ContactSource, EmailStatus, OutreachStatus
@@ -370,6 +371,19 @@ def upsert_contact(
         existing = session.exec(select(Contact).where(Contact.email == email)).first()
     if existing is None and linkedin_url:
         existing = session.exec(select(Contact).where(Contact.linkedin_url == linkedin_url)).first()
+    if existing is None and full_name and company_name:
+        # Fallback for the NO_MATCH flow: a contact saved without an email must
+        # still be found later when the user adds it by manual email address.
+        norm_name = normalize_text_key(full_name)
+        norm_company = normalize_text_key(company_name)
+        if norm_name and norm_company:
+            for candidate in session.exec(select(Contact)).all():
+                if (
+                    normalize_text_key(candidate.full_name or "") == norm_name
+                    and normalize_text_key(candidate.company_name or "") == norm_company
+                ):
+                    existing = candidate
+                    break
 
     if existing:
         existing.updated_at = get_utc_now()

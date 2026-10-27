@@ -93,10 +93,24 @@ class Settings(BaseSettings):
         description="Use a locally installed headless Chromium (optional playwright package) to render JavaScript-heavy job pages when static scraping returns an empty shell",
     )
 
-    # Contact enrichment (Prospeo) — optional; system degrades to manual email entry
+    # Contact enrichment (Prospeo) — optional; system degrades to manual email entry.
+    # Free plan includes API access: 100 credits/month (1 credit per verified email),
+    # enrich rate limits 1 req/sec, 20/min, 50/day.
     PROSPEO_API_KEY: Optional[str] = Field(
         default=None,
-        description="Prospeo API key for verified work-email enrichment (Starter plan required for API access)"
+        description="Prospeo API key for verified work-email enrichment (free plan includes API access)"
+    )
+    PROSPEO_ENRICH_ENABLED: bool = Field(
+        default=True,
+        description="Master kill-switch: set false to block all Prospeo enrichment calls"
+    )
+    PROSPEO_MAX_ENRICH_PER_DAY: int = Field(
+        default=3,
+        description="Maximum Prospeo enrich attempts per rolling 24h window (credit-safety cap on the free plan)"
+    )
+    PROSPEO_MIN_INTERVAL_SECONDS: float = Field(
+        default=1.1,
+        description="Minimum seconds between Prospeo API calls (free tier allows 1 request/second)"
     )
 
     # GitHub API (optional personal token raises the 60 req/h unauthenticated limit)
