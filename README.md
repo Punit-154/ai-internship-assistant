@@ -232,6 +232,20 @@ The assistant includes a full-featured CLI for terminal workflows:
 | `/tailor` | `/tailor <id>` | Tailors an ATS vector PDF resume and delivers it to your chat |
 | `/watch` | `/watch add lever spotify` / `/watch list` / `/watch remove 2` | Manages the ATS discovery watchlist (boards are probed before saving) |
 | `/discover` | `/discover` | Runs a discovery sweep now; alert-worthy new postings arrive as cards |
+| `/addcontact` | `/addcontact <email\|linkedin>` | Tracks a networking contact; LinkedIn URLs auto-resolve to verified work emails via Prospeo |
+| `/prospect` | `/prospect <company\|domain> [\| keyword]` | Finds recruiters / talent-acquisition people at a company via Prospeo Search-Person, then enriches one click |
+| `/contacts` | `/contacts` / `/contacts github <company>` | Lists contacts / runs the free GitHub alumni-engineer sweep |
+| `/draft` | `/draft <contact_id> [job_id]` | Drafts an approval-gated cold intro email (Gemini with truthful-template fallback) |
+| `/replied` | `/replied <id>` | Marks that this contact replied |
+| `/prospeo` | `/prospeo` | Shows the Prospeo plan, remaining credits, renewal date, and rate budgets |
+
+### Prospeo Enrichment & Recruiter Discovery (`/addcontact` + `/prospect`)
+- **Free-tier friendly economics** (self-enforced daily budget so you never blow the quota):
+  - 1 credit **enrich** per verified email — `NO_MATCH` is free, re-enrich ≤90 days is free.
+  - 1 credit **search page** per 25 recruiter profiles — repeating the same search within 30 days is free.
+  - Budgets (rolling 24h): `PROSPEO_MAX_ENRICH_PER_DAY=2`, `PROSPEO_MAX_SEARCHES_PER_DAY=1` ≈ worst case 90 credits/month against the 100-credit free plan.
+- **Setup**: free account at <https://app.prospeo.io> → API Keys → paste into `PROSPEO_API_KEY` in `.env` → restart the bot. `/prospeo` verifies the key and shows live credit telemetry.
+- **Safety**: `PROSPEO_ENRICH_ENABLED=false` is a master kill-switch; only `linkedin.com` profiles are enriched; `enrich_mobile` is never sent; results are filtered to people with a **verified email available** (`person_contact_details.email=["VERIFIED"]`, auto-retried without it if the plan rejects the filter). Nothing is ever emailed without an explicit Approve click.
 
 ### Direct Mobile Ingestion
 - **Send any URL**: Simply paste a job link into Telegram. The bot resolves the ATS, extracts requirements, checks eligibility, and replies with an interactive card.
