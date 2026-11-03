@@ -107,6 +107,12 @@ from src.services.profile import (
     get_candidate_profile,
     parse_project_from_text,
 )
+from src.services.prospecting import (
+    CODE_NO_RESULTS,
+    ProspectCandidate,
+    enrich_prospect,
+    search_recruiters,
+)
 from src.services.resume import compute_resume_base_name, rebuild_tailored_resume, tailor_resume_for_job
 
 logger = logging.getLogger(__name__)
@@ -123,8 +129,9 @@ URL_REGEX = re.compile(
 _PENDING_DRAFTS: dict = {}
 # chat_id -> {"contact_id": int, "job_id": int, "followup": bool} awaiting replacement text
 _PENDING_DRAFT_EDITS: dict = {}
-# chat_id -> {"linkedin_url": str, "name": str,...} awaiting an enriched Contact to confirm
-_PENDING_ENRICHMENT: dict = {}
+# chat_id -> {"company": str, "keyword": str, "created_at": datetime,
+#             "candidates": [ProspectCandidate]} from the last /prospect search
+_PROSPECT_STATE: dict = {}
 
 
 def is_authorized(user_id: Optional[int]) -> bool:
@@ -282,6 +289,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/watch - Manage automatic discovery boards (new!)\n"
         "/discover - Run a discovery sweep right now (new!)\n"
         "/addcontact &lt;email|-LinkedIn&gt; [| Name | Company | Role] - Track a networking contact\n"
+        "/prospect &lt;company|domain&gt; [| keyword] - Find recruiters at a company via Prospeo\n"
         "/contacts [github &lt;company&gt;] - List contacts / run alumni visibility sweep\n"
         "/draft &lt;contact_id&gt; [job_id] - Draft an approval-gated cold intro email\n"
         "/replied &lt;contact_id&gt; - Mark that this contact replied\n"
@@ -1135,6 +1143,26 @@ def _record_enrich_attempt(session, event_key: str, outcome: str) -> None:
     )
 
 
+def _prospeo_search_budget(session) -> Tuple[int, int]:
+    """(searches in the rolling 24h window, configured cap) for /prospect pages."""
+    used = count_scheduler_events_since(
+        session,
+        SchedulerEventType.PROSPEO_SEARCH_REQUEST,
+        since=get_utc_now() - timedelta(hours=24),
+    )
+    return used, settings.PROSPEO_MAX_SEARCHES_PER_DAY
+
+
+def _record_search_attempt(session, event_key: str, outcome: str) -> None:
+    """Log one /prospect search attempt (any outcome) toward the daily search budget."""
+    add_scheduler_event(
+        session,
+        SchedulerEventType.PROSPEO_SEARCH_REQUEST,
+        event_key[:190],
+        detail=outcome[:120],
+    )
+
+
 @requires_authorization
 async def cmd_addcontact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /addcontact <email-or-linkedin> [| Full Name [| Company [| Role [| relationship]]]]."""
@@ -1193,9 +1221,9 @@ async def cmd_addcontact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             used, cap = _prospeo_daily_budget(session)
         if used >= cap:
             await update.message.reply_text(
-                f"💳 <b>Enrichment budget reached</b> ({used}/{cap} attempts in the last 24h).\n"
-                "Free plan guidance: ~3/day keeps you inside 100 credits/month.\n"
-                "Swap in a fresh <code>PROSPEO_API_KEY</code>, raise <code>PROSPEO_MAX_ENRICH_PER_DAY</code> in .env, "
+            f"💳 <b>Enrichment budget reached</b> ({used}/{cap} attempts in the last 24h).\n"
+            "Free plan guidance: 2 enrich + 1 search per day keeps you inside 100 credits/month.\n"
+            "Swap in a fresh <code>PROSPEO_API_KEY</code>, raise <code>PROSPEO_MAX_ENRICH_PER_DAY</code> in .env, "
                 "or try again tomorrow.",
                 parse_mode=ParseMode.HTML,
             )
@@ -1465,6 +1493,7 @@ async def cmd_prospeo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     with get_session() as session:
         used, cap = _prospeo_daily_budget(session)
+        searches_used, search_cap = _prospeo_search_budget(session)
     remaining = account.remaining_credits if account.remaining_credits is not None else "?"
     used_credits = account.used_credits if account.used_credits is not None else "?"
     renew = f"in ~{account.next_quota_renewal_days} days" if account.next_quota_renewal_days is not None else "soon"
@@ -1473,10 +1502,156 @@ async def cmd_prospeo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🏆 Plan: <b>{html.escape(account.current_plan)}</b>\n"
         f"💳 Credits: <b>{remaining}</b> remaining ({used_credits} used this cycle)\n"
         f"📅 Quota renews {renew}\n"
-        f"📈 Enrich attempts (24h): <b>{used}/{cap}</b>\n\n"
-        "<i>1 credit per verified email • NO_MATCH is free • re-enrich ≤90 days is free.</i>\n"
+        f"📈 Enrich attempts (24h): <b>{used}/{cap}</b>\n"
+        f"🔎 /prospect searches (24h): <b>{searches_used}/{search_cap}</b>\n\n"
+        "<i>1 credit per verified email • 1 credit per search page of 25 profiles • "
+        "NO_MATCH/NO_RESULTS are free • repeats ≤90d/≤30d are free.</i>\n"
         "<i>Credits exhausted? Swap PROSPEO_API_KEY in .env and restart the bot.</i>",
         parse_mode=ParseMode.HTML,
+    )
+
+
+@requires_authorization
+async def cmd_prospect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /prospect <company-or-domain> [| keyword] — Prospeo recruiter discovery (P1.2)."""
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        await update.message.reply_text(
+            "🛰️ <b>Recruiter discovery via Prospeo</b>\n\n"
+            "<b>Usage:</b>\n"
+            "• <code>/prospect Stripe</code> — recruiters &amp; talent-acquisition people\n"
+            "• <code>/prospect stripe.com</code> — match by exact domain\n"
+            "• <code>/prospect Stripe | engineer</code> — custom role keyword\n\n"
+            "1 credit per search page (25 profiles; same search again within 30 days is free). "
+            "Enriching a candidate: 1 credit. Budget: 1 search + 2 enrich per day.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not enrichment_available():
+        await update.message.reply_text(
+            "❌ /prospect needs <code>PROSPEO_API_KEY</code> in .env (free account at "
+            "app.prospeo.io → API Keys → copy, then restart the bot).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not enrichment_enabled():
+        await update.message.reply_text(
+            "🔒 Prospeo calls are disabled (<code>PROSPEO_ENRICH_ENABLED=false</code> in .env).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    parts = [p.strip() for p in raw.split("|")]
+    company = parts[0]
+    keyword = parts[1] if len(parts) > 1 and parts[1] else None
+    if not company:
+        await update.message.reply_text(
+            "❌ Which company? <code>/prospect Stripe</code> or <code>/prospect stripe.com</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    with get_session() as session:
+        searches_used, search_cap = _prospeo_search_budget(session)
+    if searches_used >= search_cap:
+        await update.message.reply_text(
+            f"💳 <b>Search budget reached</b> ({searches_used}/{search_cap} search pages in the last 24h).\n"
+            "Searches cost 1 credit per 25 profiles (the same search again within 30 days is free) — "
+            "wait for the window to reset or raise <code>PROSPEO_MAX_SEARCHES_PER_DAY</code> in .env.\n"
+            "Meanwhile: <code>/contacts github &lt;company&gt;</code> and LinkedIn links are free.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    target_desc = html.escape(company) + (f" | {html.escape(keyword)}" if keyword else "")
+    status_msg = await update.message.reply_text(
+        f"🛰️ <i>Prospecting {target_desc} — "
+        + ("verified-email candidates only, 1 credit per 25 profiles...</i>" if settings.PROSPEO_SEARCH_VERIFIED_ONLY
+           else "1 credit per 25 profiles...</i>"),
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        page = await asyncio.to_thread(search_recruiters, company, keyword)
+    except ProspeoError as exc:
+        with get_session() as session:
+            _record_search_attempt(session, f"{company}|{keyword or ''}", outcome=f"err:{exc.code}")
+        if exc.code == CODE_RATE_LIMITED:
+            await status_msg.edit_text(
+                f"⏳ {html.escape(str(exc))}\n\n<i>Check your budget with /prospeo.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        elif exc.code == CODE_NO_RESULTS:
+            await status_msg.edit_text(
+                f"🔎 <b>Nothing found at {html.escape(company)}</b> (0 credits charged).\n"
+                f"<i>{html.escape(str(exc))}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await status_msg.edit_text(
+                f"❌ <b>Prospecting failed:</b>\n<i>{html.escape(str(exc))}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+    except ValueError as exc:
+        await status_msg.edit_text(f"❌ <b>Search refused:</b>\n<i>{html.escape(str(exc))}</i>", parse_mode=ParseMode.HTML)
+        return
+
+    with get_session() as session:
+        _record_search_attempt(session, f"{company}|{keyword or ''}", outcome="ok_free" if page.free else "ok")
+        contact_by_url = {
+            c.linkedin_url: c
+            for c in session.exec(select(Contact)).all()
+            if c.linkedin_url and c.email
+        }
+    existing_with_email = [
+        candidate for candidate in page.candidates if candidate.linkedin_url in contact_by_url
+    ]
+    shown: List[ProspectCandidate] = [
+        candidate for candidate in page.candidates if candidate.linkedin_url not in contact_by_url
+    ][:5]
+
+    if not shown:
+        already = f" ({len(existing_with_email)} already saved with emails)" if existing_with_email else ""
+        await status_msg.edit_text(
+            f"⚠️ Search returned {len(page.candidates)} people{already}, but none are new enrichable "
+            "candidates you haven't saved yet.\n"
+            "<i>Try another angle: <code>/prospect " + html.escape(company) + " | engineer</code> "
+            "(a different keyword is a new search and can charge 1 credit), or add contacts by "
+            "LinkedIn URL via /addcontact.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    credit_note = "free 30-day repeat" if page.free else "1 credit charged"
+    lines = [f"🛰️ <b>{html.escape(company)} — recruiter discovery</b>\n",
+             f"{page.total_count} people found ({credit_note}); showing the top {len(shown)} with verified emails available:\n"]
+    for idx, candidate in enumerate(shown, 1):
+        url = candidate.linkedin_url or "(no LinkedIn URL)"
+        lines.append(
+            f"<b>{idx}. {html.escape(candidate.full_name or 'Unknown name')}</b>"
+            f" — {html.escape(candidate.role_title or 'Role unknown')}"
+            f" · {html.escape(candidate.company_name or company)}\n"
+            f"    🔗 {html.escape(url)}"
+        )
+    if not page.verified_only_effective:
+        lines.append("\n<i>⚠️ Verified-email filter was plan-restricted — some profiles may not enrich.</i>")
+    lines.append("\n<i>✅ Enriching pulls the work email (1 credit each). Saved: /contacts · Draft: /draft &lt;id&gt;</i>")
+
+    rows = [[InlineKeyboardButton(f"✅ Enrich #{i + 1} (1 credit)", callback_data=f"prospect:enrich:{i}")]
+            for i in range(len(shown))]
+    rows.append([InlineKeyboardButton("🗑 Cancel", callback_data="prospect:cancel")])
+    chat_id = update.effective_chat.id
+    _PROSPECT_STATE[chat_id] = {
+        "company": company,
+        "keyword": keyword,
+        "created_at": get_utc_now(),
+        "candidates": shown,
+    }
+    await status_msg.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+        disable_web_page_preview=True,
     )
 
 
@@ -1604,6 +1779,114 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 "✏️ <b>Paste the replacement email now</b> — first line becomes the subject, the rest is the body.",
                 parse_mode=ParseMode.HTML,
             )
+
+    elif data.startswith("prospect:"):
+        parts = data.split(":")  # prospect:enrich:<idx> | prospect:cancel
+        action = parts[1] if len(parts) > 1 else ""
+        chat_id = update.effective_chat.id
+        pending = _PROSPECT_STATE.get(chat_id)
+
+        if action == "cancel":
+            _PROSPECT_STATE.pop(chat_id, None)
+            await query.answer("🗑 Prospect list discarded.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception as exc:
+                logger.debug(f"Prospect cancel cleanup: {exc}")
+            return
+
+        idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        created_at = (pending or {}).get("created_at")
+        expired = created_at is None or (get_utc_now() - created_at).total_seconds() > 86400
+        candidate = None
+        if pending and idx is not None and 0 <= idx < len(pending.get("candidates", [])):
+            candidate = pending["candidates"][idx]
+        if candidate is None or expired:
+            await query.answer("Prospect list expired — run /prospect again.", show_alert=True)
+            return
+
+        if not enrichment_enabled():
+            await query.answer("Prospeo calls are disabled (PROSPEO_ENRICH_ENABLED=false in .env).", show_alert=True)
+            return
+        if not enrichment_available():
+            await query.answer("Set PROSPEO_API_KEY in .env and restart the bot.", show_alert=True)
+            return
+
+        lookup_key = candidate.linkedin_url or candidate.person_id or candidate.full_name
+        with get_session() as session:
+            if candidate.linkedin_url:
+                existing = session.exec(select(Contact).where(Contact.linkedin_url == candidate.linkedin_url)).first()
+                if existing and existing.email:
+                    await query.answer("Already saved with an email — no Prospeo call made.", show_alert=True)
+                    return
+            used, cap = _prospeo_daily_budget(session)
+        if used >= cap:
+            await query.answer(
+                f"Enrichment budget reached ({used}/{cap} attempts in the last 24h). Try tomorrow — check /prospeo.",
+                show_alert=True,
+            )
+            return
+
+        await query.answer("🛰️ Enriching via Prospeo (1 credit, verified emails only)...")
+        try:
+            enriched = await asyncio.to_thread(enrich_prospect, candidate)
+        except ProspeoError as exc:
+            with get_session() as session:
+                _record_enrich_attempt(session, lookup_key, outcome=f"err:{exc.code}")
+            if exc.code == CODE_NO_MATCH:
+                with get_session() as session:
+                    contact, created = upsert_contact(
+                        session,
+                        full_name=candidate.full_name,
+                        company_name=candidate.company_name or pending.get("company"),
+                        role_title=candidate.role_title,
+                        relationship=pending.get("keyword") or "recruiter",
+                        email=None,
+                        linkedin_url=candidate.linkedin_url,
+                        source="prospeo",
+                        email_status="unverified",
+                    )
+                await query.message.reply_text(
+                    "🔎 <b>No verified email</b> for this candidate (0 credits charged).\n"
+                    f"✅ Contact {'saved' if created else 'updated'} anyway: <b>#{contact.id}</b>\n"
+                    + _format_contact_line(contact)
+                    + "\n\n<i>Attach an email later:</i> <code>/addcontact jane@company.com | Jane Doe | Company</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await query.message.reply_text(
+                    f"❌ <b>Enrichment failed:</b>\n<i>{html.escape(str(exc))}</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+        except ValueError as exc:
+            await query.message.reply_text(
+                f"❌ <b>Lookup refused:</b>\n<i>{html.escape(str(exc))}</i>", parse_mode=ParseMode.HTML
+            )
+            return
+
+        with get_session() as session:
+            contact, created = upsert_contact(
+                session,
+                full_name=enriched.full_name or candidate.full_name,
+                company_name=enriched.company_name or candidate.company_name or pending.get("company"),
+                role_title=enriched.role_title or candidate.role_title,
+                relationship=pending.get("keyword") or "recruiter",
+                email=enriched.email,
+                linkedin_url=enriched.linkedin_url or candidate.linkedin_url,
+                source="prospeo",
+                email_status="prospeo_verified",
+            )
+            _record_enrich_attempt(session, lookup_key, outcome="ok_free" if enriched.free_enrichment else "ok")
+        credit_line = "💳 0 credits (free 90-day repeat)" if enriched.free_enrichment else "💳 1 credit charged"
+        await query.message.reply_text(
+            f"✅ <b>Contact {'saved' if created else 'updated'}: {html.escape(contact.full_name)}</b>\n"
+            f"📧 <code>{html.escape(contact.email)}</code> | 🏢 {html.escape(contact.company_name or '—')}\n"
+            f"💼 {html.escape(contact.role_title or '—')}\n"
+            f"{credit_line}\n\n"
+            "<i>Draft an intro:</i> <code>/draft " + str(contact.id) + "</code>",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 # ==============================================================================
@@ -1811,6 +2094,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("contacts", cmd_contacts))
     app.add_handler(CommandHandler("draft", cmd_draft))
     app.add_handler(CommandHandler("replied", cmd_replied))
+    app.add_handler(CommandHandler("prospect", cmd_prospect))
     app.add_handler(CommandHandler("prospeo", cmd_prospeo))
 
     # Inline Keyboard Button Clicks
@@ -1838,7 +2122,7 @@ def run_telegram_bot() -> None:
     print(f"[*] Whitelisted Telegram User ID: {whitelist_state}")
     print("[*] Resilient HTTP timeouts: 30s connect / 30s read")
     print("[*] Resume Tailoring enabled (/tailor <id>)")
-    print("[*] Approved cold-outreach enabled (/addcontact /contacts /draft /replied /prospeo)")
+    print("[*] Approved cold-outreach enabled (/addcontact /prospect /contacts /draft /replied /prospeo)")
     print("[*] Background jobs: 8AM digest | deadline reminders | watchlist discovery | outreach follow-ups")
     print("    Manage boards with /watch | manual sweep with /discover")
     app = build_telegram_app()

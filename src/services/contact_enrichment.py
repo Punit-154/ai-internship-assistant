@@ -1,9 +1,9 @@
-"""Prospeo Contact Enrichment Adapter (P1 Outreach).
+"""Prospeo Contact Enrichment Adapter (P1/P1.2 Outreach).
 
-Turns a LinkedIn profile URL into a verified work email via the Prospeo
-"Enrich Person" REST API, feeding candidates into the approved cold-outreach
-flow. Designed around the free plan's economics so the user never accidentally
-burns their monthly quota:
+Resolves verified work emails via the Prospeo "Enrich Person" REST API — from a
+LinkedIn profile URL, a Search-Person ``person_id``, or an email — feeding
+candidates into the approved cold-outreach flow. Designed around the free
+plan's economics so the user never accidentally burns their monthly quota:
 
 - Free plan: 100 credits/month, 1 credit per revealed verified email.
   ``only_verified_email=true`` means profiles without a verified email come
@@ -82,10 +82,12 @@ class ProspeoError(RuntimeError):
         message: str,
         code: str = CODE_UNKNOWN,
         retry_after_seconds: Optional[float] = None,
+        filter_error: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.retry_after_seconds = retry_after_seconds
+        self.filter_error = filter_error
 
 
 @dataclass
@@ -188,22 +190,21 @@ def _throttle(
 # Request building & response parsing
 # ==============================================================================
 
-def _build_enrich_payload(
-    linkedin_url: str,
-    full_name: Optional[str] = None,
-    company_name: Optional[str] = None,
-) -> Dict:
-    """Enrich-Person request body: verified-email-only, never a paid mobile reveal.
-
-    Extra datapoints (name/company hints from /addcontact) raise match accuracy
-    at no cost. linkedin_url alone already satisfies the matching minimums.
-    """
-    data: Dict = {"linkedin_url": linkedin_url}
-    if full_name:
-        data["full_name"] = full_name.strip()
-    if company_name:
-        data["company_name"] = company_name.strip()
-    return {"only_verified_email": True, "enrich_mobile": False, "data": data}
+def _post_prospeo(
+    endpoint: str,
+    payload: Dict,
+    headers: Dict[str, str],
+    http_client: Optional[httpx.Client],
+    timeout: float,
+) -> httpx.Response:
+    """Single JSON POST used by enrich-person and search-person adapters."""
+    try:
+        if http_client is not None:
+            return http_client.post(endpoint, json=payload, headers=headers, timeout=timeout)
+        with httpx.Client(timeout=timeout) as fresh:
+            return fresh.post(endpoint, json=payload, headers=headers, timeout=timeout)
+    except httpx.HTTPError as exc:
+        raise ProspeoError(f"Prospeo is unreachable right now ({exc.__class__.__name__}).", code=CODE_NETWORK) from exc
 
 
 def _header_int(resp: httpx.Response, name: str) -> Optional[int]:
@@ -223,14 +224,14 @@ def _coerce_int(value) -> Optional[int]:
         return None
 
 
-def _rate_limit_message(resp: httpx.Response) -> str:
+def _rate_limit_message(resp: httpx.Response, resource: str = "enrich") -> str:
     daily_left = _header_int(resp, "x-daily-request-left")
     minute_reset = _header_int(resp, "x-minute-reset-seconds")
     daily_reset = _header_int(resp, "x-daily-reset-seconds")
     wait = minute_reset if minute_reset is not None else (daily_reset if daily_reset is not None else 60)
     parts = [f"Prospeo rate limit hit — retry in ~{wait}s"]
     if daily_left is not None:
-        parts.append(f"{daily_left} enrich requests left today")
+        parts.append(f"{daily_left} {resource} requests left today")
     elif daily_reset is not None:
         parts.append(f"daily window resets in ~{daily_reset}s")
     return "; ".join(parts) + "."
@@ -241,7 +242,7 @@ def _raise_for_error_code(error_code: str) -> None:
     raise ProspeoError(message, code=error_code)
 
 
-def _parse_enrich_response(resp: httpx.Response, fallback_url: str) -> EnrichedContact:
+def _parse_enrich_response(resp: httpx.Response, fallback_url: Optional[str] = None) -> EnrichedContact:
     """Branch on Prospeo's contract: 429 first, then JSON body's error flag."""
     if resp.status_code == 429:
         raise ProspeoError(_rate_limit_message(resp), code=CODE_RATE_LIMITED)
@@ -299,6 +300,55 @@ def _parse_enrich_response(resp: httpx.Response, fallback_url: str) -> EnrichedC
 # Public API
 # ==============================================================================
 
+def enrich_person(
+    *,
+    linkedin_url: Optional[str] = None,
+    person_id: Optional[str] = None,
+    email: Optional[str] = None,
+    full_name: Optional[str] = None,
+    company_name: Optional[str] = None,
+    api_key: Optional[str] = None,
+    http_client: Optional[httpx.Client] = None,
+    timeout: float = 10.0,
+) -> EnrichedContact:
+    """Resolve a verified work email for one person (1 credit, 0 on free repeats).
+
+    Accepts any combination of minimum datapoints — ``person_id`` (exact match
+    from Search-Person), ``linkedin_url``, or ``email``. Extra name/company
+    hints raise match accuracy at no cost.
+    """
+    key = validate_prospero_api_key(api_key or settings.PROSPEO_API_KEY)
+
+    data: Dict = {}
+    if linkedin_url:
+        cleaned_url = linkedin_url.strip()
+        if "linkedin.com" not in cleaned_url.lower():
+            raise ValueError("Provide a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/handle/).")
+        data["linkedin_url"] = cleaned_url
+    if person_id:
+        data["person_id"] = str(person_id).strip()
+    if email:
+        data["email"] = email.strip()
+    if not data:
+        raise ValueError("Provide at least one datapoint: person_id, linkedin_url, or email.")
+    if full_name:
+        data["full_name"] = full_name.strip()
+    if company_name:
+        data["company_name"] = company_name.strip()
+
+    payload = {"only_verified_email": True, "enrich_mobile": False, "data": data}
+    headers = {"X-KEY": key, "Content-Type": "application/json"}
+    _throttle()
+
+    resp = _post_prospeo(ENDPOINT_ENRICH_PERSON, payload, headers, http_client, timeout)
+    result = _parse_enrich_response(resp, None)
+    if result.credits_used:
+        logger.info("Prospeo enrichment charged 1 credit (daily_request_left=%s)", result.daily_requests_left)
+    else:
+        logger.info("Prospeo enrichment was free (90-day repeat window)")
+    return result
+
+
 def enrich_linkedin_profile(
     linkedin_url: str,
     api_key: Optional[str] = None,
@@ -308,30 +358,14 @@ def enrich_linkedin_profile(
     company_name: Optional[str] = None,
 ) -> EnrichedContact:
     """Resolve a verified work email for a single LinkedIn profile URL (1 credit)."""
-    key = validate_prospero_api_key(api_key or settings.PROSPEO_API_KEY)
-    url = linkedin_url.strip()
-    if "linkedin.com" not in url.lower():
-        raise ValueError("Provide a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/handle/).")
-
-    payload = _build_enrich_payload(url, full_name=full_name, company_name=company_name)
-    headers = {"X-KEY": key, "Content-Type": "application/json"}
-    _throttle()
-
-    try:
-        if http_client is not None:
-            resp = http_client.post(ENDPOINT_ENRICH_PERSON, json=payload, headers=headers, timeout=timeout)
-        else:
-            with httpx.Client(timeout=timeout) as fresh:
-                resp = fresh.post(ENDPOINT_ENRICH_PERSON, json=payload, headers=headers, timeout=timeout)
-    except httpx.HTTPError as exc:
-        raise ProspeoError(f"Prospeo is unreachable right now ({exc.__class__.__name__}).", code=CODE_NETWORK) from exc
-
-    result = _parse_enrich_response(resp, url)
-    if result.credits_used:
-        logger.info("Prospeo enrichment charged 1 credit (daily_request_left=%s)", result.daily_requests_left)
-    else:
-        logger.info("Prospeo enrichment was free (90-day repeat window)")
-    return result
+    return enrich_person(
+        linkedin_url=linkedin_url,
+        full_name=full_name,
+        company_name=company_name,
+        api_key=api_key,
+        http_client=http_client,
+        timeout=timeout,
+    )
 
 
 def get_prospeo_account(

@@ -6,6 +6,7 @@ from src.services.contact_enrichment import (
     ProspeoAccount,
     ProspeoError,
     enrich_linkedin_profile,
+    enrich_person,
     enrichment_available,
     enrichment_enabled,
     get_prospeo_account,
@@ -41,6 +42,13 @@ from src.services.profile import (
     save_candidate_profile,
     update_candidate_profile,
 )
+from src.services.prospecting import (
+    DEFAULT_RECRUITER_TITLES,
+    ProspectCandidate,
+    ProspectPage,
+    enrich_prospect,
+    search_recruiters,
+)
 from src.services.resume import (
     TailoredResumeResult,
     rebuild_tailored_resume,
@@ -58,11 +66,14 @@ from src.services.verifier import (
 
 __all__ = [
     "AlumniFinderError",
+    "DEFAULT_RECRUITER_TITLES",
     "EnrichedContact",
     "ExtractedJobData",
     "MatchEvaluation",
     "OutreachDraft",
     "OutreachError",
+    "ProspectCandidate",
+    "ProspectPage",
     "ProspeoError",
     "ScrapeResult",
     "TRUSTED_ATS_DOMAINS",
@@ -73,6 +84,8 @@ __all__ = [
     "craft_outreach_draft",
     "detect_scam_signals",
     "enrich_linkedin_profile",
+    "enrich_person",
+    "enrich_prospect",
     "enrichment_available",
     "evaluate_batch_eligibility",
     "evaluate_job_match",
@@ -91,6 +104,7 @@ __all__ = [
     "save_candidate_profile",
     "scrape_url",
     "search_official_career_portal",
+    "search_recruiters",
     "tailor_resume_for_job",
     "update_candidate_profile",
     "upsert_contact",

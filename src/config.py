@@ -93,24 +93,39 @@ class Settings(BaseSettings):
         description="Use a locally installed headless Chromium (optional playwright package) to render JavaScript-heavy job pages when static scraping returns an empty shell",
     )
 
-    # Contact enrichment (Prospeo) — optional; system degrades to manual email entry.
-    # Free plan includes API access: 100 credits/month (1 credit per verified email),
-    # enrich rate limits 1 req/sec, 20/min, 50/day.
+    # Contact enrichment + recruiter discovery (Prospeo) — optional; system degrades
+    # to manual email entry and LinkedIn search links without a key.
+    # Free plan includes API access: 100 credits/month. Credits: 1 per verified
+    # email; 1 per search page of 25 profiles (same search page free ≤30 days).
+    # Self-imposed daily caps: 2 enrich attempts + 1 search per day keeps the
+    # worst case at ~3 credits/day ≈ 90 credits/month.
     PROSPEO_API_KEY: Optional[str] = Field(
         default=None,
-        description="Prospeo API key for verified work-email enrichment (free plan includes API access)"
+        description="Prospeo API key for verified work-email enrichment and recruiter search (free plan includes API access)"
     )
     PROSPEO_ENRICH_ENABLED: bool = Field(
         default=True,
-        description="Master kill-switch: set false to block all Prospeo enrichment calls"
+        description="Master kill-switch: set false to block all Prospeo enrichment and search calls"
     )
     PROSPEO_MAX_ENRICH_PER_DAY: int = Field(
-        default=3,
+        default=2,
         description="Maximum Prospeo enrich attempts per rolling 24h window (credit-safety cap on the free plan)"
+    )
+    PROSPEO_MAX_SEARCHES_PER_DAY: int = Field(
+        default=1,
+        description="Maximum /prospect search pages per rolling 24h window (1 credit per 25 profiles; same page free ≤30 days)"
+    )
+    PROSPEO_SEARCH_VERIFIED_ONLY: bool = Field(
+        default=True,
+        description="Filter /prospect results to people with a verified email available (auto-retries without it if the plan rejects the filter)"
     )
     PROSPEO_MIN_INTERVAL_SECONDS: float = Field(
         default=1.1,
-        description="Minimum seconds between Prospeo API calls (free tier allows 1 request/second)"
+        description="Minimum seconds between Prospeo enrich-account calls (free tier allows 1 request/second)"
+    )
+    PROSPEO_SEARCH_MIN_INTERVAL_SECONDS: float = Field(
+        default=2.0,
+        description="Minimum seconds between Prospeo /search-person calls (search endpoints have lower rate limits)"
     )
 
     # GitHub API (optional personal token raises the 60 req/h unauthenticated limit)
